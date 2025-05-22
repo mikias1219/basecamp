@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environment
+venv/
+env/
+ENV/
+base/
+.venv/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Environment variable files
+.env
+.env.*
+
+# VSCode and IDE configs
+.vscode/
+.idea/
+
+# Streamlit cache and config
+.streamlit/config.toml
+.streamlit/secrets.toml
+.streamlit/*.json
+.streamlit/cache/
+.streamlit/**/*.pickle
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Test and coverage files
+htmlcov/
+.tox/
+.nox/
+coverage.*
+.cache
+pytest_cache/
