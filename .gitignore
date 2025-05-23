@@ -11,6 +11,7 @@ env/
 ENV/
 base/
 .venv/
+secrets/
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints
