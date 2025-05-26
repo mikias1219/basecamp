@@ -490,12 +490,12 @@ def post_comment(account_id: int, project_id: int, recording_id: int, access_tok
     data = {"content": api_content}
 
     # Validate mentions in api_content
-    valid_ids = {str(p["id"]) for p in people if p.get("id")}
-    mention_pattern = r'<bc-attachment sgid="[^"]+" content-type="application/vnd.basecamp.mention">.*?data-avatar-for-person-id="(\d+)"'
-    mentioned_ids = set(re.findall(mention_pattern, api_content, re.DOTALL))
-    if mentioned_ids and not mentioned_ids.issubset(valid_ids):
-        logging.warning(f"Comment contains invalid person IDs: {mentioned_ids - valid_ids}")
-        st.warning("Comment may not tag correctly; unexpected person IDs detected.")
+    valid_sgids = {p["sgid"] for p in people if p.get("sgid")}
+    mention_pattern = r'<bc-attachment sgid="([^"]+)" content-type="application/vnd.basecamp.mention">'
+    mentioned_sgids = set(re.findall(mention_pattern, api_content))
+    if mentioned_sgids and not mentioned_sgids.issubset(valid_sgids):
+        logging.warning(f"Comment contains invalid sgids: {mentioned_sgids - valid_sgids}")
+        st.warning("Comment may not tag correctly; unexpected person sgids detected.")
 
     try:
         response = requests.post(url, headers=headers, json=data, timeout=REQUEST_TIMEOUT)
@@ -775,33 +775,55 @@ def check_new_task_data(account_id: int, access_token: str, existing_data: List[
     logging.info(f"Task data check completed in {time.time() - start_time:.2f} seconds")
     return new_data, updated
 
-def generate_smart_reply(task: Dict, comments: List[Dict], mentions: List[Dict], selam_mention: Dict = None, cc_mention: Dict = None) -> tuple[str, str]:
-    """Generate a smart reply with names for UI and <bc-attachment> mentions for API."""
+def generate_smart_reply(task: Dict, comments: List[Dict], mentions: List[Dict], selam_mention: List[Dict] = None, cc_mention: List[Dict] = None, user_question: str = "", reply_type: str = "Short") -> tuple[str, str]:
+    """Generate a smart reply with names for UI and <bc-attachment> mentions for API, tailored to user question and reply type."""
     headers = {"Content-Type": "application/json"}
     
-    # Handle Selam and Cc mentions
-    selam_name = selam_mention.get("name", "") if selam_mention else ""
-    cc_name = cc_mention.get("name", "") if cc_mention else ""
-    selam_mention_str = format_mentions(selam_mention, is_cc=False) if selam_mention else ""
-    cc_mention_str = format_mentions(cc_mention, is_cc=True) if cc_mention else ""
+    # Handle Selam mentions
+    selam_mention = selam_mention or []
+    selam_names = ", ".join(p.get("name", "") for p in selam_mention if p.get("name"))
+    selam_mention_str = ", ".join(format_mentions(p, is_cc=False) for p in selam_mention if p.get("sgid"))
+    
+    # Handle Cc mentions
+    cc_mention = cc_mention or []
+    cc_names = ", ".join(p.get("name", "") for p in cc_mention if p.get("name"))
+    cc_mention_str = ", ".join(format_mentions(p, is_cc=True) for p in cc_mention if p.get("sgid"))
     
     # Handle additional mentions
     mention_names = [person["name"] for person in mentions if person.get("name")]
-    mention_tags = [format_mentions(person, is_cc=False) for person in mentions]
+    mention_tags = [format_mentions(person, is_cc=False) for person in mentions if person.get("sgid")]
     mention_str_ui = ", ".join(mention_names) if mention_names else ""
     mention_str_api = " ".join(mention_tags) if mention_tags else ""
     
     # Validate mentions
-    for person in mentions + ([selam_mention] if selam_mention else []) + ([cc_mention] if cc_mention else []):
+    for person in mentions + selam_mention + cc_mention:
         if person and not person.get("sgid"):
             logging.warning(f"Person {person.get('name', 'Unknown')} lacks sgid, mention may fail.")
             st.warning(f"Person {person.get('name', 'Unknown')} cannot be tagged properly due to missing data.")
     
     comment_context = "\n".join([f"Comment by {c.get('creator', 'N/A')}: {c.get('content', 'N/A')}" for c in comments]) or "No comments available."
     
-    selam_prefix_ui = f"Selam {selam_name}" if selam_name else "Selam"
-    cc_suffix_ui = f"Cc {cc_name}" if cc_name else "Looking forward to your thoughts!"
+    selam_prefix_ui = f"Selam {selam_names}" if selam_names else "Selam"
+    cc_suffix_ui = f"Cc {cc_names}" if cc_names else "Looking forward to your thoughts!"
     mentions_ui = f"Mentions: {mention_str_ui}" if mention_str_ui else ""
+    
+    # Determine prompt based on reply type and user question
+    if user_question:
+        question_context = f"User Question: {user_question}\n"
+        if "update" in user_question.lower() or reply_type == "Update":
+            prompt_instruction = "Provide a concise status update addressing the user's question or task context."
+        elif "question" in user_question.lower() or "?" in user_question:
+            prompt_instruction = "Answer the user's question concisely, incorporating task context."
+        else:
+            prompt_instruction = "Generate a professional reply addressing the user's input and task context."
+    else:
+        question_context = ""
+        prompt_instruction = "Generate a concise, professional reply to the latest comment or task context."
+    
+    if reply_type == "Short":
+        prompt_instruction = f"{prompt_instruction} Keep the reply short (1-2 sentences)."
+    elif reply_type == "Long":
+        prompt_instruction = f"{prompt_instruction} Provide a detailed response (3-5 sentences)."
     
     prompt = f"""
     Task: {task['title']}
@@ -810,12 +832,12 @@ def generate_smart_reply(task: Dict, comments: List[Dict], mentions: List[Dict],
     Assignee: {task['assignee']}
     Creator: {task['creator']}
     Comments: {comment_context}
+    {question_context}
     
-    Generate a concise, professional reply to the latest comment or task context.
+    {prompt_instruction}
     - Start with '{selam_prefix_ui}'.
     - Acknowledge the latest comment (if any) or task status.
     - Include mentions: {mention_str_ui}.
-    - Provide a relevant update, question, or action item.
     - End with '{cc_suffix_ui}'.
     - Use plain names for mentions (e.g., 'Selamawit Getaneh') in the body for display.
     - Ensure the reply is suitable for posting to Basecamp with proper mentions.
@@ -828,17 +850,17 @@ def generate_smart_reply(task: Dict, comments: List[Dict], mentions: List[Dict],
             generated_content = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "No reply generated")
             if not generated_content.lower().startswith("selam"):
                 generated_content = f"{selam_prefix_ui}, {generated_content.lstrip(' ,.')}".strip()
-            if cc_name and not generated_content.rstrip().endswith(cc_suffix_ui):
+            if cc_names and not generated_content.rstrip().endswith(cc_suffix_ui):
                 generated_content = f"{generated_content.rstrip('.')} {cc_suffix_ui}".strip()
-            elif not cc_name and not generated_content.rstrip().endswith("Looking forward to your thoughts!"):
+            elif not cc_names and not generated_content.rstrip().endswith("Looking forward to your thoughts!"):
                 generated_content = f"{generated_content.rstrip('.')} Looking forward to your thoughts!".strip()
             
             # Create API version with <bc-attachment> mentions
             api_content = generated_content
-            if selam_name and selam_mention_str:
-                api_content = api_content.replace(f"Selam {selam_name}", f"Selam {selam_mention_str}")
-            if cc_name and cc_mention_str:
-                api_content = api_content.replace(f"Cc {cc_name}", cc_mention_str)
+            if selam_names and selam_mention_str:
+                api_content = api_content.replace(f"Selam {selam_names}", f"Selam {selam_mention_str}")
+            if cc_names and cc_mention_str:
+                api_content = api_content.replace(f"Cc {cc_names}", cc_mention_str)
             if mention_names and mention_str_api:
                 if "Mentions:" in api_content:
                     api_content = api_content.replace(f"Mentions: {mention_str_ui}", mention_str_api)
@@ -1325,46 +1347,52 @@ def main():
                     if not people:
                         st.warning("No people available for tagging in this project. You can still generate and post comments without mentions.")
                     
-                    # Initialize session state for suggestions
-                    if 'mention_input' not in st.session_state:
-                        st.session_state.mention_input = ""
-                    if 'selected_mentions' not in st.session_state:
-                        st.session_state.selected_mentions = []
-
-                    # Name suggestion input
-                    st.write("Type names to mention (suggestions appear as you type):")
-                    mention_input = st.text_input("Search for people to mention", value=st.session_state.mention_input, key="mention_input")
-                    
-                    # Filter people based on input
                     people_names = [p['name'] for p in people if p.get("name") and p.get("name") != "Unknown"]
-                    suggestions = [name for name in people_names if mention_input.lower() in name.lower()] if mention_input else []
                     
-                    if suggestions:
-                        selected_suggestion = st.selectbox("Suggested names:", ["Select a name"] + suggestions, key="suggestion_select")
-                        if selected_suggestion != "Select a name" and st.button("Add Mention"):
-                            if selected_suggestion not in st.session_state.selected_mentions:
-                                st.session_state.selected_mentions.append(selected_suggestion)
-                                st.session_state.mention_input = ""  # Clear input after adding
-                            else:
-                                st.warning(f"{selected_suggestion} is already selected.")
-                    
-                    # Display selected mentions
-                    if st.session_state.selected_mentions:
-                        st.write("Selected Mentions:", ", ".join(st.session_state.selected_mentions))
-                        if st.button("Clear Mentions"):
-                            st.session_state.selected_mentions = []
-                    
-                    # Selam and Cc dropdowns
-                    selam_person_name = st.selectbox("Select person to tag after 'Selam':", ["None"] + people_names, key="selam_person")
-                    cc_person_name = st.selectbox("Select person to tag in 'Cc' (optional):", ["None"] + people_names, key="cc_person")
-                    
-                    if st.button("Generate Smart Reply"):
+                    # Multiselect for mentions (limited to 2)
+                    selected_mentions = st.multiselect(
+                        "Select up to 2 people to mention:",
+                        people_names,
+                        default=None,
+                        max_selections=2,
+                        key="mention_select"
+                    )
+
+                    # Multiselect for Selam
+                    selected_selam = st.multiselect(
+                        "Select people to tag after 'Selam':",
+                        people_names,
+                        default=None,
+                        key="selam_multiselect"
+                    )
+
+                    # Multiselect for Cc
+                    selected_cc = st.multiselect(
+                        "Select people to tag in 'Cc' (optional):",
+                        people_names,
+                        default=None,
+                        key="cc_multiselect"
+                    )
+
+                    # User question and reply type
+                    user_question = st.text_input("Enter your question or context for the smart reply (optional):", key="user_question")
+                    reply_type = st.selectbox("Select reply type:", ["Short", "Long", "Update"], key="reply_type")
+
+                    if st.button("Generate Smart Reply", key="generate_smart_reply"):
                         with st.spinner("Generating reply..."):
-                            selam_person = next((p for p in people if p.get("name") == selam_person_name), None) if selam_person_name and selam_person_name != "None" else None
-                            cc_person = next((p for p in people if p.get("name") == cc_person_name), None) if cc_person_name and cc_person_name != "None" else None
-                            mention_people = [p for p in people if p.get("name") in st.session_state.selected_mentions]
+                            selam_people = [p for p in people if p.get("name") in selected_selam]
+                            cc_people = [p for p in people if p.get("name") in selected_cc]
+                            mention_people = [p for p in people if p.get("name") in selected_mentions]
                             
-                            ui_reply, api_reply = generate_smart_reply(task, task['comments'], mention_people, selam_person, cc_person)
+                            ui_reply, api_reply = generate_smart_reply(
+                                task,
+                                task['comments'],
+                                mention_people,
+                                selam_people,
+                                cc_people,
+                                user_question=user_question,
+                                reply_type=reply_type
+                            )
                             if "Failed to generate reply" in ui_reply or "Error generating reply" in ui_reply:
                                 st.error(f"Error: {ui_reply}")
                                 st.session_state.smart_reply = None
@@ -1373,26 +1401,30 @@ def main():
                                 st.session_state.smart_reply = ui_reply
                                 st.session_state.smart_reply_api = api_reply
                                 st.markdown(f"<div class='output-box'><strong>Suggested Reply</strong>:<br>{ui_reply}</div>", unsafe_allow_html=True)
+                                st.session_state.edit_reply = ui_reply
 
                     if 'smart_reply' in st.session_state and st.session_state.smart_reply:
-                        edited_reply = st.text_area("Edit Reply", value=st.session_state.smart_reply, key="edit_reply")
-                        if st.button("Post Reply"):
+                        edited_reply = st.text_area("Edit Reply", value=st.session_state.get("edit_reply", st.session_state.smart_reply), key="edit_reply")
+                        if st.button("Post Reply", key="post_reply"):
                             with st.spinner("Posting reply..."):
-                                # Create API version of edited reply
                                 api_edited_reply = edited_reply
-                                selam_person = next((p for p in people if p.get("name") == selam_person_name), None) if selam_person_name and selam_person_name != "None" else None
-                                cc_person = next((p for p in people if p.get("name") == cc_person_name), None) if cc_person_name and cc_person_name != "None" else None
-                                mention_people = [p for p in people if p.get("name") in st.session_state.selected_mentions]
-                                
-                                if selam_person:
-                                    api_edited_reply = api_edited_reply.replace(f"Selam {selam_person['name']}", f"Selam {format_mentions(selam_person)}")
-                                if cc_person:
-                                    api_edited_reply = api_edited_reply.replace(f"Cc {cc_person['name']}", format_mentions(cc_person, is_cc=True))
-                                if st.session_state.selected_mentions:
-                                    mentions_ui = f"Mentions: {', '.join(st.session_state.selected_mentions)}"
-                                    mentions_api = " ".join([format_mentions(p) for p in mention_people])
+                                selam_people = [p for p in people if p.get("name") in selected_selam]
+                                cc_people = [p for p in people if p.get("name") in selected_cc]
+                                mention_people = [p for p in people if p.get("name") in selected_mentions]
+
+                                if selam_people:
+                                    selam_names = ", ".join(p["name"] for p in selam_people)
+                                    selam_mentions = ", ".join(format_mentions(p, is_cc=False) for p in selam_people)
+                                    api_edited_reply = api_edited_reply.replace(f"Selam {selam_names}", f"Selam {selam_mentions}")
+                                if cc_people:
+                                    cc_names = ", ".join(p["name"] for p in cc_people)
+                                    cc_mentions = ", ".join(format_mentions(p, is_cc=True) for p in cc_people)
+                                    api_edited_reply = api_edited_reply.replace(f"Cc {cc_names}", cc_mentions)
+                                if selected_mentions:
+                                    mentions_ui = f"Mentions: {', '.join(selected_mentions)}"
+                                    mentions_api = " ".join(format_mentions(p, is_cc=False) for p in mention_people)
                                     api_edited_reply = api_edited_reply.replace(mentions_ui, mentions_api) if mentions_ui in api_edited_reply else f"{api_edited_reply} {mentions_api}"
-                                
+
                                 success, display_content = post_comment(
                                     st.session_state.account_id,
                                     project['project_id'],
@@ -1416,14 +1448,14 @@ def main():
                                     save_task_data(st.session_state.task_data)
                                     st.session_state.smart_reply = None
                                     st.session_state.smart_reply_api = None
+                                    st.session_state.edit_reply = ""
                                     st.session_state.comment_page = 1
-                                    st.session_state.selected_mentions = []  # Clear mentions after posting
                                 else:
                                     st.error("Failed to post reply.")
 
                     # AI Insights
                     st.subheader("AI Insights")
-                    if st.button("Generate Insights"):
+                    if st.button("Generate Insights", key="generate_insights"):
                         with st.spinner("Generating insights..."):
                             insights = fetch_gemini_insights(task, task['comments'])
                             st.markdown(f"<div class='output-box'><strong>Task Insights</strong>:<br>{insights}</div>", unsafe_allow_html=True)
@@ -1437,26 +1469,37 @@ def main():
             <img src="https://via.placeholder.com/600x200.png?text=Settings" alt="Settings Image">
         </div>
         """, unsafe_allow_html=True)
-        if st.button("Authenticate and Fetch Data"):
-            with st.spinner("Authenticating..."):
-                access_token = get_access_token()
-                if access_token:
-                    st.session_state.access_token = access_token
-                    account_id = get_account_info(access_token)
-                    if account_id:
-                        st.session_state.account_id = account_id
-                        st.session_state.checkins = []
-                        new_data, updated = check_new_task_data(account_id, access_token, st.session_state.task_data)
-                        st.session_state.task_data = new_data
-                        save_task_data(new_data)
-                        st.success("Authentication successful and data fetched!")
-                    else:
-                        st.error("Failed to fetch account ID.")
-                        if os.path.exists(TOKEN_FILE):
-                            os.remove(TOKEN_FILE)
+        # In the Settings section
+    if st.button("Authenticate"):
+        with st.spinner("Authenticating..."):
+            access_token = get_access_token()
+            if access_token:
+                st.session_state.access_token = access_token
+                account_id = get_account_info(access_token)
+                if account_id:
+                    st.session_state.account_id = account_id
+                    st.success("Authentication successful!")
                 else:
-                    st.error("Authentication failed.")
+                    st.error("Failed to fetch account ID.")
+                    if os.path.exists(TOKEN_FILE):
+                        os.remove(TOKEN_FILE)
+            else:
+                st.error("Authentication failed.")
 
+    if st.button("Fetch Data"):
+        if not st.session_state.access_token:
+            st.error("Please authenticate first")
+        else:
+            with st.spinner("Fetching data..."):
+                st.session_state.checkins = []
+                new_data, updated = check_new_task_data(
+                    st.session_state.account_id, 
+                    st.session_state.access_token, 
+                    st.session_state.task_data
+                )
+                st.session_state.task_data = new_data
+                save_task_data(new_data)
+                st.success("Data fetched successfully!")
     elif page == "Debug":
         st.header("Debug Information")
         st.write("Diagnose issues with check-in and task fetching.")
