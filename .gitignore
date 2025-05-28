@@ -12,7 +12,7 @@ ENV/
 base/
 .venv/
 secrets/
-task_data.json
+
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints

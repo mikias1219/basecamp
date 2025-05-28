@@ -41,7 +41,53 @@ TASK_DATA_FILE = "task_data.json"
 TOKEN_FILE = "access_token.json"
 REPORTS_FILE = "reports.json"
 TOKEN_EXPIRY = timedelta(days=1)
+# Load RAG (cultural context) data for smart replies and insights
+RAG_FILE = "AllData_cleaned.json"
 
+def load_rag_data() -> List[Dict]:
+    try:
+        with open(RAG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            logging.debug(f"Loaded {len(data)} RAG entries from {RAG_FILE}")
+            return data
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logging.debug(f"No RAG file found or invalid: {str(e)}")
+        return []
+
+def retrieve_relevant_data(data: List[Dict], task: Dict, query: str = "", mode: str = "insights") -> str:
+    """
+    Retrieve relevant context from RAG (cultural) data for a given task and query.
+    This function is used only for cultural context (RAG) and does not affect other functionalities.
+    """
+    rag_data = load_rag_data()
+    relevant_context = []
+    query = query.lower().strip()
+    task_title = task.get('title', '').lower()
+    project_id = task.get('project_id', None)
+    keywords = query.split() + task_title.split() if query else task_title.split()
+
+    for entry in rag_data:
+        entry_project_id = entry.get('project_id')
+        if project_id and entry_project_id and entry_project_id != project_id:
+            continue
+        entry_title = entry.get('title', '').lower()
+        entry_comments = entry.get('comments', [])
+        entry_text = entry_title + ' ' + ' '.join(
+            c.get('cleaned_content', '') for c in entry_comments
+        )
+        if task.get('id') == entry.get('id') or any(keyword in entry_text for keyword in keywords):
+            cultural_comments = [c for c in entry_comments if c.get('is_cultural', False)]
+            task_summary = f"Task: {entry.get('title', '')}, Status: {entry.get('status', '')}, Due: {entry.get('due_on', '')}"
+            comments = [f"Comment by {c.get('creator', '')}: {c.get('cleaned_content', '')}" for c in (cultural_comments or entry_comments)][:2]
+            relevant_context.append(f"Project: {entry.get('project_name', '')}\n{task_summary}\n" + "\n".join(comments))
+            if mode == "insights" and relevant_context:
+                # If mode is insights, return only the most relevant context (first match)
+                return relevant_context[0]
+            elif mode == "all" and relevant_context:
+                # If mode is all, return all relevant context joined
+                return "\n\n".join(relevant_context)
+    context = "\n\n".join(relevant_context[:3])
+    return context or f"Current Task: {task.get('title', '')}, Status: {task.get('status', '')}, Due: {task.get('due_on', '')}"
 CONFIG = {
     "CLIENT_ID": "6c916f56910da5118a83a2bf9c762d2967c430f0",
     "CLIENT_SECRET": "5b139ebdf83caec06caff04c02180e93e1d28374"
@@ -64,7 +110,7 @@ def save_access_token(token: str, expiry: datetime):
         logging.error(f"Failed to save access token: {str(e)}")
         st.error("Failed to save access token.")
 
-def load_access_token() -> Optional[Dict]:
+def load_access_token(session_id: str) -> Optional[Dict]:
     try:
         with open(TOKEN_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -74,13 +120,12 @@ def load_access_token() -> Optional[Dict]:
                 os.remove(TOKEN_FILE)
                 return None
             try:
-                # Parse expiry as UTC-aware datetime
                 expiry = datetime.fromisoformat(expiry_str)
                 if expiry.tzinfo is None:
-                    # If parsed datetime is naive, assume it's UTC
                     expiry = expiry.replace(tzinfo=timezone.utc)
-                # Compare with current UTC time
                 if datetime.now(timezone.utc) < expiry:
+                    # Store token in session state with session_id key
+                    st.session_state[f'access_token_{session_id}'] = data.get("access_token")
                     return {"access_token": data.get("access_token"), "expiry": expiry}
                 else:
                     logging.info("Access token expired, removing token file")
@@ -93,6 +138,7 @@ def load_access_token() -> Optional[Dict]:
     except (FileNotFoundError, json.JSONDecodeError) as e:
         logging.debug(f"Token file not found or invalid: {str(e)}")
         return None
+
 def find_available_port(start_port: int = 8000, max_attempts: int = 10) -> int:
     port = start_port
     for _ in range(max_attempts):
@@ -167,11 +213,19 @@ def get_paginated_results(url: str, headers: Dict, params: Optional[Dict] = None
             break
     return results
 
-def get_access_token():
-    token_data = load_access_token()
+def get_access_token(session_id: str):
+    token_data = load_access_token(session_id)
     if token_data:
         logging.debug("Using existing access token")
         return token_data["access_token"]
+
+    # Clear stale token file
+    if os.path.exists(TOKEN_FILE):
+        try:
+            os.remove(TOKEN_FILE)
+            logging.info("Cleared stale token file")
+        except Exception as e:
+            logging.error(f"Failed to remove stale token file: {str(e)}")
 
     port = find_available_port()
     AUTH_URL = f"https://launchpad.37signals.com/authorization/new?type=web_server&client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}"
@@ -198,10 +252,9 @@ def get_access_token():
                         token_data = token_response.json()
                         access_token = token_data.get("access_token")
                         if access_token:
-                            # Use UTC-aware datetime
                             expiry = datetime.now(timezone.utc) + TOKEN_EXPIRY
                             save_access_token(access_token, expiry)
-                            st.session_state.access_token = access_token
+                            st.session_state[f'access_token_{session_id}'] = access_token
                             self.respond_with("Success! You can close this tab.")
                         else:
                             logging.error("No access token in response")
@@ -222,14 +275,18 @@ def get_access_token():
             self.end_headers()
             self.wfile.write(f"<html><body><h1>{message}</h1></body></html>".encode())
 
-    st.info("Opening browser for Basecamp authorization...")
-    logging.info("Initiating OAuth flow")
-    webbrowser.open(AUTH_URL)
-    with socketserver.TCPServer(("localhost", port), OAuthHandler) as httpd:
-        httpd.timeout = 120
-        httpd.handle_request()
+    try:
+        st.info("Opening browser for Basecamp authorization...")
+        logging.info("Initiating OAuth flow")
+        webbrowser.open(AUTH_URL)
+        with socketserver.TCPServer(("localhost", port), OAuthHandler) as httpd:
+            httpd.timeout = 120
+            httpd.handle_request()
+    except Exception as e:
+        logging.error(f"OAuth server error: {str(e)}")
+        st.error("Failed to start OAuth server. Check network and port availability.")
 
-    token = st.session_state.get("access_token")
+    token = st.session_state.get(f'access_token_{st.session_state.session_id}')
     if not token:
         logging.error("OAuth flow failed, no access token obtained")
         st.error("Authentication failed. Please try again.")
@@ -479,39 +536,40 @@ def get_new_comments(account_id: int, project_id: int, task_id: int, access_toke
         } for comment in response.json() if comment.get("id") not in existing_comment_ids]
     return []
 
-def post_comment(account_id: int, project_id: int, recording_id: int, access_token: str, ui_content: str, api_content: str, people: List[Dict]) -> tuple[bool, str]:
-    """Post a comment to a Basecamp task and return success status and UI content for display."""
+def post_comment(account_id: int, project_id: int, recording_id: int, access_token: str, ui_content: str, people: List[Dict]) -> tuple[bool, str]:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "User-Agent": "BasecampAI (mulukenashenafi84@outlook.com)",
         "Content-Type": "application/json"
     }
     url = f"{BASE_URL}/{account_id}/buckets/{project_id}/recordings/{recording_id}/comments.json"
-    data = {"content": api_content}
-
-    # Validate mentions in api_content
+    
+    # Process mentions
+    final_ui_content, api_content, mentioned_people_data = process_mentions_in_reply(ui_content, people)
+    
+    # Validate mentions
     valid_sgids = {p["sgid"] for p in people if p.get("sgid")}
     mention_pattern = r'<bc-attachment sgid="([^"]+)" content-type="application/vnd.basecamp.mention">'
     mentioned_sgids = set(re.findall(mention_pattern, api_content))
     if mentioned_sgids and not mentioned_sgids.issubset(valid_sgids):
-        logging.warning(f"Comment contains invalid sgids: {mentioned_sgids - valid_sgids}")
-        st.warning("Comment may not tag correctly; unexpected person sgids detected.")
+        logging.warning(f"Invalid sgids in comment: {mentioned_sgids - valid_sgids}")
+        st.error(f"Cannot post comment: Invalid mentions detected.")
+        return False, final_ui_content
 
     try:
-        response = requests.post(url, headers=headers, json=data, timeout=REQUEST_TIMEOUT)
+        response = requests.post(url, headers=headers, json={"content": api_content}, timeout=REQUEST_TIMEOUT)
         if response.status_code == 201:
             logging.info(f"Posted comment to task {recording_id}")
-            return True, ui_content
+            return True, final_ui_content
         else:
             logging.error(f"Comment post failed: {response.status_code} - {response.text}")
             st.error(f"Failed to post comment: {response.status_code} - {response.text}")
-            return False, ui_content
+            return False, final_ui_content
     except Exception as e:
         logging.error(f"Comment post error: {str(e)}")
         st.error(f"Comment post error: {str(e)}")
-        return False, ui_content
+        return False, final_ui_content
 def get_project_people(account_id: int, project_id: int, access_token: str) -> List[Dict]:
-    """Fetch all people in a Basecamp project with sgid for tagging, handling pagination."""
     headers = {
         "Authorization": f"Bearer {access_token}",
         "User-Agent": "BasecampAI (mulukenashenafi84@outlook.com)",
@@ -519,11 +577,15 @@ def get_project_people(account_id: int, project_id: int, access_token: str) -> L
     }
     url = f"{BASE_URL}/{account_id}/projects/{project_id}/people.json"
     try:
-        response = retry_request(requests.get, url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response = retry_request(requests.get, url, headers=headers, timeout=30)  # Increased timeout
         if not response or response.status_code != 200:
             error_msg = f"Failed to fetch people for project {project_id}: HTTP {response.status_code if response else 'No response'}"
             logging.error(error_msg)
-            if response and response.status_code == 403:
+            if response:
+                logging.debug(f"Response details: {response.text}")
+            if response and response.status_code == 401:
+                st.error("Authentication failed. Please re-authenticate in Settings.")
+            elif response and response.status_code == 403:
                 st.error("Insufficient permissions to view project members. Ensure your Basecamp account has access.")
             elif response and response.status_code == 404:
                 st.error(f"Project {project_id} not found. Verify the project ID or check if it’s archived.")
@@ -565,9 +627,13 @@ def get_project_people(account_id: int, project_id: int, access_token: str) -> L
         if not valid_people:
             st.warning(f"No people found for project {project_id}. Check project permissions or add people in Basecamp.")
         return valid_people
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Network error fetching people for project {project_id}: {str(e)}")
+        st.error(f"Network error: Unable to connect to Basecamp API. Check your internet connection or try again later.")
+        return []
     except Exception as e:
-        logging.error(f"Error fetching people for project {project_id}: {str(e)}")
-        st.error(f"Error fetching people for project {project_id}: {str(e)}")
+        logging.error(f"Unexpected error fetching people for project {project_id}: {str(e)}")
+        st.error(f"Unexpected error: {str(e)}")
         return []
 def clean_answer_text(text: str) -> str:
     if not text:
@@ -775,118 +841,211 @@ def check_new_task_data(account_id: int, access_token: str, existing_data: List[
     logging.info(f"Task data check completed in {time.time() - start_time:.2f} seconds")
     return new_data, updated
 
-def generate_smart_reply(task: Dict, comments: List[Dict], mentions: List[Dict], selam_mention: List[Dict] = None, cc_mention: List[Dict] = None, user_question: str = "", reply_type: str = "Short") -> tuple[str, str]:
-    """Generate a smart reply with names for UI and <bc-attachment> mentions for API, tailored to user question and reply type."""
+import logging
+import re
+import requests
+from typing import Dict, List, Tuple
+def generate_smart_reply(
+    task: Dict,
+    comments: List[Dict],
+    mentioned_people: List[Dict],
+    user_question: str = "",
+    reply_type: str = "Short",
+    project_id: int = None,
+    account_id: int = None,
+    access_token: str = None
+) -> Tuple[str, str, List[Dict]]:
     headers = {"Content-Type": "application/json"}
-    
-    # Handle Selam mentions
-    selam_mention = selam_mention or []
-    selam_names = ", ".join(p.get("name", "") for p in selam_mention if p.get("name"))
-    selam_mention_str = ", ".join(format_mentions(p, is_cc=False) for p in selam_mention if p.get("sgid"))
-    
-    # Handle Cc mentions
-    cc_mention = cc_mention or []
-    cc_names = ", ".join(p.get("name", "") for p in cc_mention if p.get("name"))
-    cc_mention_str = ", ".join(format_mentions(p, is_cc=True) for p in cc_mention if p.get("sgid"))
-    
-    # Handle additional mentions
-    mention_names = [person["name"] for person in mentions if person.get("name")]
-    mention_tags = [format_mentions(person, is_cc=False) for person in mentions if person.get("sgid")]
-    mention_str_ui = ", ".join(mention_names) if mention_names else ""
-    mention_str_api = " ".join(mention_tags) if mention_tags else ""
-    
-    # Validate mentions
-    for person in mentions + selam_mention + cc_mention:
-        if person and not person.get("sgid"):
-            logging.warning(f"Person {person.get('name', 'Unknown')} lacks sgid, mention may fail.")
-            st.warning(f"Person {person.get('name', 'Unknown')} cannot be tagged properly due to missing data.")
-    
+    GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=AIzaSyArWCID8FdgwcFJpS_mUJNlLy6QJhMvf5w"
+
+    # Fetch valid project people
+    valid_people = get_project_people(account_id, project_id, access_token) if account_id and project_id and access_token else mentioned_people
+    valid_people_dict = {p["sgid"]: p for p in valid_people if p.get("sgid") and p.get("name") and p.get("id")}
+
+    # Validate and deduplicate mentioned people
+    def validate_person(person: Dict) -> bool:
+        required_fields = ["sgid", "name", "id"]
+        if not person or any(not person.get(field) for field in required_fields):
+            logging.warning(f"Person {person.get('name', 'Unknown')} lacks required fields: {person}")
+            st.warning(f"Person {person.get('name', 'Unknown')} cannot be tagged due to missing data.")
+            return False
+        if person["sgid"] not in valid_people_dict:
+            logging.warning(f"Person {person.get('name')} with sgid {person.get('sgid')} not found in project people")
+            st.warning(f"Person {person.get('name')} is not a valid project member and cannot be tagged.")
+            return False
+        return True
+
+    mentioned_people = [p for p in mentioned_people if validate_person(p)]
+    unique_persons = {p["sgid"]: p for p in mentioned_people}
+
+    # Format mentions for prompt
+    allowed_names = ", ".join(p["name"] for p in unique_persons.values()) or "none"
     comment_context = "\n".join([f"Comment by {c.get('creator', 'N/A')}: {c.get('content', 'N/A')}" for c in comments]) or "No comments available."
-    
-    selam_prefix_ui = f"Selam {selam_names}" if selam_names else "Selam"
-    cc_suffix_ui = f"Cc {cc_names}" if cc_names else "Looking forward to your thoughts!"
-    mentions_ui = f"Mentions: {mention_str_ui}" if mention_str_ui else ""
-    
-    # Determine prompt based on reply type and user question
+
+    # Prepare prompt with common words
+    prompt_instruction = (
+        f"Generate a professional reply for a Basecamp task, using culturally appropriate terms like 'Selam' (as a greeting), 'Noted' (to acknowledge), and 'Done' (to indicate completion) where suitable. "
+        f"Use only these names in the reply body: {allowed_names}. "
+        f"Do NOT include company names (e.g., 'Network Solutions') or other non-person entities. "
+        f"Do NOT repeat names or append fragments (e.g., 'Yabsra Fekadu Yabsra'). "
+        f"Do NOT prefix names with 'Cc' in the body text. "
+        f"If names are provided, start with 'Selam [Name]' if appropriate. "
+        f"If no names are provided, do not mention anyone."
+    )
     if user_question:
         question_context = f"User Question: {user_question}\n"
         if "update" in user_question.lower() or reply_type == "Update":
-            prompt_instruction = "Provide a concise status update addressing the user's question or task context."
+            prompt_instruction += " Provide a concise status update using 'Done' if the task is complete or 'Noted' to acknowledge the question."
         elif "question" in user_question.lower() or "?" in user_question:
-            prompt_instruction = "Answer the user's question concisely, incorporating task context."
+            prompt_instruction += " Answer the user's question concisely, using 'Noted' to acknowledge if appropriate."
         else:
-            prompt_instruction = "Generate a professional reply addressing the user's input and task context."
+            prompt_instruction += " Generate a professional reply addressing the user's input, using 'Selam' or 'Noted' where fitting."
     else:
         question_context = ""
-        prompt_instruction = "Generate a concise, professional reply to the latest comment or task context."
-    
+        prompt_instruction += " Generate a concise, professional reply to the task, using 'Done' if the task is complete or 'Noted' to acknowledge comments."
+
     if reply_type == "Short":
-        prompt_instruction = f"{prompt_instruction} Keep the reply short (1-2 sentences)."
+        prompt_instruction += " Keep the reply short (1-2 sentences)."
     elif reply_type == "Long":
-        prompt_instruction = f"{prompt_instruction} Provide a detailed response (3-5 sentences)."
-    
+        prompt_instruction += " Provide a detailed response (3-5 sentences)."
+
+    # Add cultural context
+    cultural_context = retrieve_relevant_data(load_rag_data(), task, "", mode="insights")
+    if cultural_context:
+        prompt_instruction = f"Consider the following cultural context:\n{cultural_context}\n\n{prompt_instruction}"
+
     prompt = f"""
-    Task: {task['title']}
-    Status: {task['status']}
-    Due Date: {task['due_on']}
-    Assignee: {task['assignee']}
-    Creator: {task['creator']}
-    Comments: {comment_context}
-    {question_context}
-    
-    {prompt_instruction}
-    - Start with '{selam_prefix_ui}'.
-    - Acknowledge the latest comment (if any) or task status.
-    - Include mentions: {mention_str_ui}.
-    - End with '{cc_suffix_ui}'.
-    - Use plain names for mentions (e.g., 'Selamawit Getaneh') in the body for display.
-    - Ensure the reply is suitable for posting to Basecamp with proper mentions.
-    """
+Task: {task['title']}
+Status: {task['status']}
+Due Date: {task['due_on']}
+Assignee: {task['assignee']}
+Creator: {task['creator']}
+Comments: {comment_context}
+{question_context}
+
+{prompt_instruction}
+- Acknowledge the latest comment or task status using only the listed names in the body.
+- Use 'Selam [Name]' as a greeting if mentioning specific people, 'Noted' to acknowledge comments or questions, and 'Done' for completed tasks.
+- Ensure the reply is professional, concise, and suitable for Basecamp.
+- Do NOT include unlisted names or non-person entities: {allowed_names}.
+"""
+
+    logging.info(f"Sending prompt to Gemini: {prompt}")
     data = {"contents": [{"parts": [{"text": prompt}]}]}
     try:
         response = requests.post(GEMINI_URL, headers=headers, json=data, timeout=REQUEST_TIMEOUT)
         if response.ok:
             result = response.json()
-            generated_content = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "No reply generated")
-            if not generated_content.lower().startswith("selam"):
-                generated_content = f"{selam_prefix_ui}, {generated_content.lstrip(' ,.')}".strip()
-            if cc_names and not generated_content.rstrip().endswith(cc_suffix_ui):
-                generated_content = f"{generated_content.rstrip('.')} {cc_suffix_ui}".strip()
-            elif not cc_names and not generated_content.rstrip().endswith("Looking forward to your thoughts!"):
-                generated_content = f"{generated_content.rstrip('.')} Looking forward to your thoughts!".strip()
-            
-            # Create API version with <bc-attachment> mentions
+            generated_content = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "No reply generated").strip()
+            logging.debug(f"Raw Gemini response: {generated_content}")
+
+            # Clean UI content
+            generated_content = re.sub(r'\s*,\s*,\s*', ', ', generated_content)
+            generated_content = re.sub(r'\s*\.\s*\.\s*', '. ', generated_content)
+            generated_content = re.sub(r'\s+', ' ', generated_content).strip()
+            if not generated_content.endswith('.'):
+                generated_content += '.'
+
+            # Remove duplicated name fragments
+            for person in unique_persons.values():
+                name = person["name"]
+                name_parts = name.split()
+                if len(name_parts) >= 2:
+                    first_name = name_parts[0]
+                    generated_content = re.sub(rf'\b{re.escape(name)}\s+{re.escape(first_name)}\b', name, generated_content)
+                    generated_content = re.sub(rf'\b{re.escape(first_name)}\b(?!\s+[A-Z][a-z]+)', '', generated_content)
+
+            # Check for unexpected names
+            all_valid_names = set(p["name"] for p in valid_people_dict.values())
+            found_names = set(re.findall(r'\b(?!Selam\b|Cc\b|Network\sSolutions\b|IE\b)([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\b', generated_content))
+            unexpected_names = found_names - all_valid_names
+            if unexpected_names:
+                logging.warning(f"Unexpected names detected: {unexpected_names}")
+                st.warning(f"Unexpected names detected in reply: {', '.join(unexpected_names)}. Removing them.")
+                for name in unexpected_names:
+                    generated_content = re.sub(r'\b' + re.escape(name) + r'\b', '', generated_content)
+                generated_content = ' '.join(generated_content.split())
+
+            # Initialize API content
             api_content = generated_content
-            if selam_names and selam_mention_str:
-                api_content = api_content.replace(f"Selam {selam_names}", f"Selam {selam_mention_str}")
-            if cc_names and cc_mention_str:
-                api_content = api_content.replace(f"Cc {cc_names}", cc_mention_str)
-            if mention_names and mention_str_api:
-                if "Mentions:" in api_content:
-                    api_content = api_content.replace(f"Mentions: {mention_str_ui}", mention_str_api)
-                else:
-                    api_content = f"{api_content.rstrip('.')} {mention_str_api}".strip()
-            
-            # Validate API content for mentions
-            mention_pattern = r'<bc-attachment sgid="[^"]+" content-type="application/vnd.basecamp.mention">'
-            if (selam_mention or cc_mention or mentions) and not re.search(mention_pattern, api_content):
-                logging.warning("API content lacks expected mention tags")
-                st.warning("Generated reply may not include proper mentions for Basecamp.")
-            
-            return generated_content, api_content
+
+            # Prepare edit reply data
+            edit_reply_data = [
+                {
+                    "name": p["name"],
+                    "sgid": p["sgid"],
+                    "id": p["id"],
+                    "email_address": p.get("email_address", "N/A"),
+                    "title": p.get("title", ""),
+                    "company": p.get("company", "N/A"),
+                    "avatar_url": p.get("avatar_url", "https://bc3-production-assets-cdn.basecamp-static.com/default/avatar?v=1")
+                } for p in unique_persons.values()
+            ]
+
+            logging.debug(f"UI reply: {generated_content}")
+            logging.debug(f"API reply: {api_content}")
+            logging.debug(f"Edit reply data: {edit_reply_data}")
+            return generated_content, api_content, edit_reply_data
         else:
             error_message = response.json().get("error", {}).get("message", "Unknown API error")
             logging.error(f"Gemini API error: {response.status_code} - {response.text}")
-            error_ui = f"{selam_prefix_ui}, Failed to generate reply: {error_message} {cc_suffix_ui}".strip()
-            return error_ui, error_ui
+            error_ui = f"Failed to generate reply: {error_message}."
+            return error_ui, error_ui, []
     except Exception as e:
         logging.error(f"Gemini API request failed: {str(e)}")
-        error_ui = f"{selam_prefix_ui}, Error generating reply: {str(e)} {cc_suffix_ui}".strip()
-        return error_ui, error_ui
+        error_ui = f"Error generating reply: {str(e)}."
+        return error_ui, error_ui, []
+def process_mentions_in_reply(ui_reply: str, valid_people: List[Dict]) -> Tuple[str, str, List[Dict]]:
+    """
+    Process @Name mentions in the UI reply, converting them to Basecamp <bc-attachment> tags for API content.
+    Returns (ui_reply, api_reply, mentioned_people_data).
+    """
+    mentioned_people_data = []
+    api_reply = ui_reply
+    valid_people_dict = {p["name"].lower(): p for p in valid_people if p.get("sgid") and p.get("name") and p.get("id")}
+
+    # Find all @Name mentions
+    mention_pattern = r'@([A-Za-z\s]+)(?=\s|$|[.,!?])'
+    matches = re.findall(mention_pattern, ui_reply)
+    
+    for name in matches:
+        name = name.strip()
+        name_lower = name.lower()
+        # Try to match full name first, then partial (first name)
+        person = valid_people_dict.get(name_lower)
+        if not person:
+            # Try partial match (e.g., just first name)
+            person = next((p for n, p in valid_people_dict.items() if n.startswith(name_lower)), None)
+        if person:
+            if person not in mentioned_people_data:
+                mentioned_people_data.append({
+                    "name": person["name"],
+                    "sgid": person["sgid"],
+                    "id": person["id"],
+                    "email_address": person.get("email_address", "N/A"),
+                    "title": person.get("title", ""),
+                    "company": person.get("company", "N/A"),
+                    "avatar_url": person.get("avatar_url", "https://bc3-production-assets-cdn.basecamp-static.com/default/avatar?v=1")
+                })
+            mention_tag = format_mentions(person, is_cc=False)
+            # Replace @Name with plain name in UI reply, and with <bc-attachment> in API reply
+            ui_reply = re.sub(rf'@{re.escape(name)}\b', person["name"], ui_reply, flags=re.IGNORECASE)
+            api_reply = re.sub(rf'@{re.escape(name)}\b', mention_tag, api_reply, flags=re.IGNORECASE)
+        else:
+            logging.warning(f"Mentioned name '{name}' not found in valid people")
+            st.warning(f"'{name}' is not a valid project member and will not be tagged.")
+
+    # Clean up any remaining @ symbols
+    ui_reply = re.sub(r'@\w+\b', '', ui_reply)
+    api_reply = re.sub(r'@\w+\b', '', api_reply)
+
+    return ui_reply, api_reply, mentioned_people_data
 def format_mentions(person: Dict, is_cc: bool = False) -> str:
     """Format a person's mention in Basecamp <bc-attachment> syntax with all required details."""
-    if not person or not person.get("id") or not person.get("sgid"):
+    required_fields = ["id", "sgid", "name"]
+    if not person or any(not person.get(field) for field in required_fields):
         logging.warning(f"Invalid person data for mention: {person}")
+        st.warning(f"Person {person.get('name', 'Unknown')} cannot be tagged due to missing data.")
         return ""
     name = person["name"]
     sgid = person["sgid"]
@@ -935,73 +1094,29 @@ def fetch_gemini_insights(task: Dict, comments: List[Dict]) -> str:
 st.set_page_config(page_title="Basecamp AI & Check-in Analyzer", layout="wide")
 
 def main():
-    # Custom CSS for styling
+    # Custom CSS (unchanged)
     st.markdown("""
     <style>
-    .navbar {
-        background-color: #1a73e8;
-        padding: 15px;
-        color: white;
-        font-size: 24px;
-        font-weight: bold;
-        text-align: center;
-        margin-bottom: 20px;
-        border-radius: 8px;
-    }
-    .sidebar .sidebar-content {
-        background-color: #f8f9fa;
-        padding: 15px;
-        border-radius: 8px;
-    }
-    .stButton>button {
-        background-color: #1a73e8;
-        color: white;
-        border-radius: 8px;
-        padding: 10px 20px;
-        font-weight: bold;
-    }
-    .stButton>button:hover {
-        background-color: #1557b0;
-    }
-    .stTextInput input, .stSelectbox select, .stTextArea textarea {
-        border-radius: 8px;
-        padding: 10px;
-    }
-    .stSuccess, .stError, .stInfo, .stWarning {
-        border-radius: 8px;
-        padding: 10px;
-    }
-    .output-box {
-        border: 1px solid #bdc3c7;
-        padding: 15px;
-        border-radius: 8px;
-        background-color: #f9f9f9;
-        margin-top: 10px;
-    }
-    .comment-box, .answer-box {
-        border: 1px solid #e0e0e0;
-        padding: 15px;
-        border-radius: 8px;
-        margin-bottom: 10px;
-        background-color: #ffffff;
-    }
-    .image-container {
-        display: flex;
-        justify-content: center;
-        margin: 20px 0;
-    }
-    .image-container img {
-        max-width: 100%;
-        border-radius: 8px;
-        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-    }
+    .navbar { background-color: #1a73e8; padding: 15px; color: white; font-size: 24px; font-weight: bold; text-align: center; margin-bottom: 20px; border-radius: 8px; }
+    .sidebar .sidebar-content { background-color: #f8f9fa; padding: 15px; border-radius: 8px; }
+    .stButton>button { background-color: #1a73e8; color: white; border-radius: 8px; padding: 10px 20px; font-weight: bold; }
+    .stButton>button:hover { background-color: #1557b0; }
+    .stTextInput input, .stSelectbox select, .stTextArea textarea { border-radius: 8px; padding: 10px; }
+    .stSuccess, .stError, .stInfo, .stWarning { border-radius: 8px; padding: 10px; }
+    .output-box { border: 1px solid #bdc3c7; padding: 15px; border-radius: 8px; background-color: #f9f9f9; margin-top: 10px; }
+    .comment-box, .answer-box { border: 1px solid #e0e0e0; padding: 15px; border-radius: 8px; margin-bottom: 10px; background-color: #ffffff; }
+    .image-container { display: flex; justify-content: center; margin: 20px 0; }
+    .image-container img { max-width: 100%; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
     </style>
     <div class="navbar">Basecamp AI & Check-in Analyzer</div>
     """, unsafe_allow_html=True)
 
     # Initialize session state
-    if 'access_token' not in st.session_state:
-        st.session_state.access_token = None
+    if 'session_id' not in st.session_state:
+        st.session_state.session_id = uuid.uuid4().hex
+        logging.info(f"Initialized session_id: {st.session_state.session_id}")
+    if f'access_token_{st.session_state.session_id}' not in st.session_state:
+        st.session_state[f'access_token_{st.session_state.session_id}'] = None
     if 'account_id' not in st.session_state:
         st.session_state.account_id = None
     if 'checkins' not in st.session_state:
@@ -1014,6 +1129,8 @@ def main():
         st.session_state.comment_page = 1
     if 'items_per_page' not in st.session_state:
         st.session_state.items_per_page = 5
+    if 'selected_mentions' not in st.session_state:
+        st.session_state.selected_mentions = []
 
     # Sidebar navigation
     st.sidebar.title("Navigation")
@@ -1060,14 +1177,14 @@ def main():
         </div>
         """, unsafe_allow_html=True)
 
-        if not st.session_state.access_token or not st.session_state.account_id:
+        if not st.session_state[f'access_token_{st.session_state.session_id}'] or not st.session_state[f'access_token_{st.session_state.session_id}']:
             st.error("Please authenticate in the Settings page to proceed.")
             return
 
         # Fetch check-ins
         if not st.session_state.checkins or st.button("Refresh Check-ins"):
             with st.spinner("Fetching check-ins..."):
-                st.session_state.checkins = get_all_checkins(st.session_state.account_id, st.session_state.access_token)
+                st.session_state.checkins = get_all_checkins(st.session_state.account_id, st.session_state[f'access_token_{st.session_state.session_id}'])
                 if not st.session_state.checkins:
                     st.warning("No check-in questions found. Check permissions or questionnaire setup in Basecamp.")
                     return
@@ -1097,7 +1214,7 @@ def main():
                     selected_checkin_data["account_id"],
                     selected_checkin_data["bucket_id"],
                     [selected_checkin_data["question_id"]],
-                    st.session_state.access_token,
+                    st.session_state[f'access_token_{st.session_state.session_id}'],
                     start_date.strftime("%Y-%m-%d"),
                     end_date.strftime("%Y-%m-%d")
                 )
@@ -1247,12 +1364,12 @@ def main():
         project = next((p for p in st.session_state.task_data if p['project_name'] == selected_project), None)
         
         if project:
-            if st.session_state.access_token and st.session_state.account_id:
+            if st.session_state[f'access_token_{st.session_state.session_id}']and st.session_state[f'access_token_{st.session_state.session_id}']:
                 if st.sidebar.button("Refresh Task Data"):
                     with st.spinner("Checking for task updates..."):
                         new_data, updated = check_new_task_data(
                             st.session_state.account_id,
-                            st.session_state.access_token,
+                            st.session_state[f'access_token_{st.session_state.session_id}'],
                             st.session_state.task_data,
                             selected_project
                         )
@@ -1285,6 +1402,9 @@ def main():
                     with col2:
                         st.write(f"**Assignee**: {task['assignee']}")
                         st.write(f"**Creator**: {task['creator']}")
+
+                    # Fetch people for mentions before using them
+                    people = get_project_people(st.session_state.account_id, project['project_id'], st.session_state[f'access_token_{st.session_state.session_id}'])
 
                     # Comments with pagination
                     st.subheader("Comments")
@@ -1322,13 +1442,13 @@ def main():
 
                     # Fetch new comments
                     if st.button("Fetch New Comments"):
-                        if st.session_state.access_token and st.session_state.account_id:
+                        if st.session_state[f'access_token_{st.session_state.session_id}'] and st.session_state.account_id:
                             with st.spinner("Fetching new comments..."):
                                 new_comments = get_new_comments(
                                     st.session_state.account_id,
                                     project['project_id'],
                                     task['id'],
-                                    st.session_state.access_token,
+                                    st.session_state[f'access_token_{st.session_state.session_id}'],
                                     task['comments']
                                 )
                                 if new_comments:
@@ -1341,97 +1461,67 @@ def main():
                         else:
                             st.error("Please authenticate in Settings.")
 
-                    # Smart Reply with Mentions
+                    # Smart Reply
                     st.subheader("Smart Reply")
-                    people = get_project_people(st.session_state.account_id, project['project_id'], st.session_state.access_token)
+                    people = get_project_people(
+                        st.session_state.account_id,
+                        project['project_id'],
+                        st.session_state.get(f'access_token_{st.session_state.session_id}')
+                    )
                     if not people:
                         st.warning("No people available for tagging in this project. You can still generate and post comments without mentions.")
-                    
-                    people_names = [p['name'] for p in people if p.get("name") and p.get("name") != "Unknown"]
-                    
-                    # Multiselect for mentions (limited to 2)
-                    selected_mentions = st.multiselect(
-                        "Select up to 2 people to mention:",
-                        people_names,
-                        default=None,
-                        max_selections=2,
-                        key="mention_select"
-                    )
+                        people_names = []
+                    else:
+                        people_names = [p['name'] for p in people if p.get("name") and p.get("sgid") and p.get("id")]
+                        st.write("**Mention People**: Type @Name in the reply below to tag project members (e.g., @Mikias).")
 
-                    # Multiselect for Selam
-                    selected_selam = st.multiselect(
-                        "Select people to tag after 'Selam':",
-                        people_names,
-                        default=None,
-                        key="selam_multiselect"
-                    )
-
-                    # Multiselect for Cc
-                    selected_cc = st.multiselect(
-                        "Select people to tag in 'Cc' (optional):",
-                        people_names,
-                        default=None,
-                        key="cc_multiselect"
-                    )
-
-                    # User question and reply type
                     user_question = st.text_input("Enter your question or context for the smart reply (optional):", key="user_question")
                     reply_type = st.selectbox("Select reply type:", ["Short", "Long", "Update"], key="reply_type")
 
-                    if st.button("Generate Smart Reply", key="generate_smart_reply"):
+                    if st.button("Generate Smart Reply", key="generate_smart_reply_task"):
                         with st.spinner("Generating reply..."):
-                            selam_people = [p for p in people if p.get("name") in selected_selam]
-                            cc_people = [p for p in people if p.get("name") in selected_cc]
-                            mention_people = [p for p in people if p.get("name") in selected_mentions]
-                            
-                            ui_reply, api_reply = generate_smart_reply(
+                            ui_reply, api_reply, edit_reply_data = generate_smart_reply(
                                 task,
                                 task['comments'],
-                                mention_people,
-                                selam_people,
-                                cc_people,
+                                [],  # No mentions initially; user will add via @Name in edit
                                 user_question=user_question,
-                                reply_type=reply_type
+                                reply_type=reply_type,
+                                project_id=project['project_id'],
+                                account_id=st.session_state.account_id,
+                                access_token=st.session_state.get(f'access_token_{st.session_state.session_id}')
                             )
                             if "Failed to generate reply" in ui_reply or "Error generating reply" in ui_reply:
                                 st.error(f"Error: {ui_reply}")
                                 st.session_state.smart_reply = None
                                 st.session_state.smart_reply_api = None
+                                st.session_state.edit_reply_data = []
                             else:
                                 st.session_state.smart_reply = ui_reply
                                 st.session_state.smart_reply_api = api_reply
+                                st.session_state.edit_reply_data = edit_reply_data
                                 st.markdown(f"<div class='output-box'><strong>Suggested Reply</strong>:<br>{ui_reply}</div>", unsafe_allow_html=True)
                                 st.session_state.edit_reply = ui_reply
+                                if edit_reply_data:
+                                    st.subheader("Mentioned People")
+                                    for person in edit_reply_data:
+                                        st.write(f"- Name: {person['name']}, SGID: {person['sgid']}, ID: {person['id']}, "
+                                                 f"Email: {person.get('email_address', 'N/A')}, Title: {person.get('title', '')}, "
+                                                 f"Company: {person.get('company', 'N/A')}, Avatar: {person.get('avatar_url')}")
 
-                    if 'smart_reply' in st.session_state and st.session_state.smart_reply:
-                        edited_reply = st.text_area("Edit Reply", value=st.session_state.get("edit_reply", st.session_state.smart_reply), key="edit_reply")
+                    if st.session_state.get("smart_reply"):
+                        initial_reply = "" if st.session_state.get("reset_reply", False) else st.session_state.get("edit_reply", st.session_state.smart_reply)
+                        edited_reply = st.text_area("Edit Reply", value=initial_reply, key="edit_reply", help="Type @Name to mention people (e.g., @Mikias).")
+                        if st.session_state.get("reset_reply", False):
+                            st.session_state.reset_reply = False
+
                         if st.button("Post Reply", key="post_reply"):
                             with st.spinner("Posting reply..."):
-                                api_edited_reply = edited_reply
-                                selam_people = [p for p in people if p.get("name") in selected_selam]
-                                cc_people = [p for p in people if p.get("name") in selected_cc]
-                                mention_people = [p for p in people if p.get("name") in selected_mentions]
-
-                                if selam_people:
-                                    selam_names = ", ".join(p["name"] for p in selam_people)
-                                    selam_mentions = ", ".join(format_mentions(p, is_cc=False) for p in selam_people)
-                                    api_edited_reply = api_edited_reply.replace(f"Selam {selam_names}", f"Selam {selam_mentions}")
-                                if cc_people:
-                                    cc_names = ", ".join(p["name"] for p in cc_people)
-                                    cc_mentions = ", ".join(format_mentions(p, is_cc=True) for p in cc_people)
-                                    api_edited_reply = api_edited_reply.replace(f"Cc {cc_names}", cc_mentions)
-                                if selected_mentions:
-                                    mentions_ui = f"Mentions: {', '.join(selected_mentions)}"
-                                    mentions_api = " ".join(format_mentions(p, is_cc=False) for p in mention_people)
-                                    api_edited_reply = api_edited_reply.replace(mentions_ui, mentions_api) if mentions_ui in api_edited_reply else f"{api_edited_reply} {mentions_api}"
-
                                 success, display_content = post_comment(
                                     st.session_state.account_id,
                                     project['project_id'],
                                     task['id'],
-                                    st.session_state.access_token,
+                                    st.session_state.get(f'access_token_{st.session_state.session_id}'),
                                     edited_reply,
-                                    api_edited_reply,
                                     people
                                 )
                                 if success:
@@ -1441,15 +1531,16 @@ def main():
                                         st.session_state.account_id,
                                         project['project_id'],
                                         task['id'],
-                                        st.session_state.access_token,
+                                        st.session_state.get(f'access_token_{st.session_state.session_id}'),
                                         task['comments']
                                     )
                                     task['comments'].extend(new_comments)
                                     save_task_data(st.session_state.task_data)
                                     st.session_state.smart_reply = None
                                     st.session_state.smart_reply_api = None
-                                    st.session_state.edit_reply = ""
+                                    st.session_state.edit_reply_data = []
                                     st.session_state.comment_page = 1
+                                    st.session_state.reset_reply = True
                                 else:
                                     st.error("Failed to post reply.")
 
@@ -1472,9 +1563,9 @@ def main():
         # In the Settings section
     if st.button("Authenticate"):
         with st.spinner("Authenticating..."):
-            access_token = get_access_token()
+            access_token = get_access_token(st.session_state.session_id)
             if access_token:
-                st.session_state.access_token = access_token
+                st.session_state[f'access_token_{st.session_state.session_id}'] = access_token
                 account_id = get_account_info(access_token)
                 if account_id:
                     st.session_state.account_id = account_id
@@ -1484,17 +1575,17 @@ def main():
                     if os.path.exists(TOKEN_FILE):
                         os.remove(TOKEN_FILE)
             else:
-                st.error("Authentication failed.")
+                st.error("Authentication failed. Ensure network connectivity and try again.")
 
     if st.button("Fetch Data"):
-        if not st.session_state.access_token:
+        if not st.session_state[f'access_token_{st.session_state.session_id}']:
             st.error("Please authenticate first")
         else:
             with st.spinner("Fetching data..."):
                 st.session_state.checkins = []
                 new_data, updated = check_new_task_data(
                     st.session_state.account_id, 
-                    st.session_state.access_token, 
+                    st.session_state[f'access_token_{st.session_state.session_id}'], 
                     st.session_state.task_data
                 )
                 st.session_state.task_data = new_data
@@ -1508,14 +1599,14 @@ def main():
             <img src="https://via.placeholder.com/600x200.png?text=Debug" alt="Debug Image">
         </div>
         """, unsafe_allow_html=True)
-        if not st.session_state.access_token or not st.session_state.account_id:
+        if not st.session_state[f'access_token_{st.session_state.session_id}'] or not st.session_state.account_id:
             st.error("Please authenticate in the Settings page to view debug info.")
             return
 
         st.subheader("Check-in Fetching Debug")
         if st.button("Fetch Raw Check-in Data"):
             with st.spinner("Fetching raw check-in data..."):
-                headers = {"Authorization": f"Bearer {st.session_state.access_token}", "User-Agent": "BasecampAI (mulukenashenafi84@outlook.com)"}
+                headers = {"Authorization": f"Bearer {st.session_state[f'access_token_{st.session_state.session_id}']}", "User-Agent": "BasecampAI (mulukenashenafi84@outlook.com)"}
                 buckets_url = f"{BASE_URL}/{st.session_state.account_id}/projects.json"
                 buckets_response = retry_request(requests.get, buckets_url, headers=headers, timeout=REQUEST_TIMEOUT)
                 if buckets_response and buckets_response.ok:
@@ -1547,18 +1638,20 @@ def main():
         st.subheader("Task Fetching Debug")
         if st.button("Fetch Raw Task Data"):
             with st.spinner("Fetching raw task data..."):
-                projects = get_projects(st.session_state.account_id, st.session_state.access_token)
+                projects = get_projects(st.session_state.account_id, st.session_state[f'access_token_{st.session_state.session_id}'])
                 st.write(f"**Projects Fetched**: {len(projects)}")
                 st.json(projects)
                 for project in projects:
                     if project['todoset_id']:
-                        todolists = get_todoset(st.session_state.account_id, project['id'], project['todoset_id'], st.session_state.access_token)
+                        todolists = get_todoset(st.session_state.account_id, project['id'], project['todoset_id'], st.session_state[f'access_token_{st.session_state.session_id}'])
                         st.write(f"**Todolists for Project {project['name']}**: {len(todolists)}")
                         st.json(todolists)
                         for todolist in todolists:
-                            tasks = get_tasks(st.session_state.account_id, project['id'], todolist['id'], st.session_state.access_token)
+                            tasks = get_tasks(st.session_state.account_id, project['id'], todolist['id'],st.session_state[f'access_token_{st.session_state.session_id}'])
                             st.write(f"**Tasks for Todolist {todolist['title']}**: {len(tasks)}")
                             st.json(tasks)
 
 if __name__ == "__main__":
     main()
+
+    

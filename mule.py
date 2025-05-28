@@ -172,7 +172,7 @@ def get_access_token():
                         access_token = token_data.get("access_token")
                         if access_token:
                             save_access_token(access_token, datetime.now() + TOKEN_EXPIRY)
-                            st.session_state.access_token = access_token
+                            st.session_state[f\'access_token_{st.session_state.session_id}\'] = access_token
                             self.respond_with("Success! You can close this tab.")
                         else:
                             logging.error("No access token in response")
@@ -465,7 +465,7 @@ def main():
     """, unsafe_allow_html=True)
 
     if 'access_token' not in st.session_state:
-        st.session_state.access_token = None
+        st.session_state[f\'access_token_{st.session_state.session_id}\'] = None
     if 'account_id' not in st.session_state:
         st.session_state.account_id = None
     if 'checkins' not in st.session_state:
@@ -478,14 +478,14 @@ def main():
         st.header("Check-in Analysis")
         st.write("Analyze Basecamp Automatic Check-in responses to generate internship reports and insights.")
 
-        if not st.session_state.access_token or not st.session_state.account_id:
+        if not st.session_state[f\'access_token_{st.session_state.session_id}\'] or not st.session_state.account_id:
             st.error("Please authenticate in the Settings page to proceed.")
             return
 
         # Fetch all check-ins
         if not st.session_state.checkins or st.button("Refresh Check-ins"):
             with st.spinner("Fetching available check-ins..."):
-                st.session_state.checkins = get_all_checkins(st.session_state.account_id, st.session_state.access_token)
+                st.session_state.checkins = get_all_checkins(st.session_state.account_id, st.session_state[f\'access_token_{st.session_state.session_id}\'])
                 if not st.session_state.checkins:
                     st.warning(f"""
                     No check-in questions found. Possible causes:
@@ -516,14 +516,14 @@ def main():
             st.error("Start date must be before end date.")
             return
 
-        if st.button("Fetch Check-in Data", disabled=not st.session_state.access_token):
+        if st.button("Fetch Check-in Data", disabled=not st.session_state[f\'access_token_{st.session_state.session_id}\']):
             with st.spinner("Fetching check-in data..."):
                 try:
                     answers = fetch_and_structure_answers(
                         selected_checkin_data["account_id"],
                         selected_checkin_data["bucket_id"],
                         [selected_checkin_data["question_id"]],
-                        st.session_state.access_token,
+                        st.session_state[f\'access_token_{st.session_state.session_id}\'],
                         start_date.strftime("%Y-%m-%d"),
                         end_date.strftime("%Y-%m-%d")
                     )
@@ -603,7 +603,7 @@ def main():
             with st.spinner("Authenticating..."):
                 access_token = get_access_token()
                 if access_token:
-                    st.session_state.access_token = access_token
+                    st.session_state[f\'access_token_{st.session_state.session_id}\'] = access_token
                     account_id = get_account_info(access_token)
                     if account_id:
                         st.session_state.account_id = account_id
@@ -620,14 +620,14 @@ def main():
     elif page == "Debug":
         st.header("Debug Information")
         st.write("Use this page to diagnose issues with check-in fetching.")
-        if not st.session_state.access_token or not st.session_state.account_id:
+        if not st.session_state[f\'access_token_{st.session_state.session_id}\'] or not st.session_state.account_id:
             st.error("Please authenticate in the Settings page to view debug info.")
             return
 
         st.subheader("Check-in Fetching Debug")
         if st.button("Fetch Raw Check-in Data"):
             with st.spinner("Fetching raw check-in data..."):
-                headers = {"Authorization": f"Bearer {st.session_state.access_token}", "User-Agent": "BasecampAI (mulukenashenafi84@outlook.com)"}
+                headers = {"Authorization": f"Bearer {st.session_state[f\'access_token_{st.session_state.session_id}\']}", "User-Agent": "BasecampAI (mulukenashenafi84@outlook.com)"}
                 buckets_url = f"{BASE_URL}/{st.session_state.account_id}/projects.json"
                 buckets_response = retry_request(requests.get, buckets_url, headers=headers, timeout=REQUEST_TIMEOUT)
                 if buckets_response and buckets_response.ok:
@@ -672,7 +672,7 @@ def main():
         if st.button("Fetch Questions for Questionnaire"):
             if questionnaire_id and bucket_id:
                 with st.spinner("Fetching questions..."):
-                    headers = {"Authorization": f"Bearer {st.session_state.access_token}", "User-Agent": "BasecampAI (mulukenashenafi84@outlook.com)"}
+                    headers = {"Authorization": f"Bearer {st.session_state[f\'access_token_{st.session_state.session_id}\']}", "User-Agent": "BasecampAI (mulukenashenafi84@outlook.com)"}
                     questions_url = f"{BASE_URL}/{st.session_state.account_id}/buckets/{bucket_id}/questionnaires/{questionnaire_id}/questions.json"
                     questions_response = retry_request(requests.get, questions_url, headers=headers, timeout=REQUEST_TIMEOUT)
                     if questions_response and questions_response.ok:

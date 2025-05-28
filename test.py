@@ -201,7 +201,7 @@ def get_access_token():
                             # Use UTC-aware datetime
                             expiry = datetime.now(timezone.utc) + TOKEN_EXPIRY
                             save_access_token(access_token, expiry)
-                            st.session_state.access_token = access_token
+                            st.session_state[f\'access_token_{st.session_state.session_id}\'] = access_token
                             self.respond_with("Success! You can close this tab.")
                         else:
                             logging.error("No access token in response")
@@ -836,7 +836,7 @@ def main():
 
     # Initialize session state
     if 'access_token' not in st.session_state:
-        st.session_state.access_token = None
+        st.session_state[f\'access_token_{st.session_state.session_id}\'] = None
     if 'account_id' not in st.session_state:
         st.session_state.account_id = None
     if 'checkins' not in st.session_state:
@@ -895,14 +895,14 @@ def main():
         </div>
         """, unsafe_allow_html=True)
 
-        if not st.session_state.access_token or not st.session_state.account_id:
+        if not st.session_state[f\'access_token_{st.session_state.session_id}\'] or not st.session_state.account_id:
             st.error("Please authenticate in the Settings page to proceed.")
             return
 
         # Fetch check-ins
         if not st.session_state.checkins or st.button("Refresh Check-ins"):
             with st.spinner("Fetching check-ins..."):
-                st.session_state.checkins = get_all_checkins(st.session_state.account_id, st.session_state.access_token)
+                st.session_state.checkins = get_all_checkins(st.session_state.account_id, st.session_state[f\'access_token_{st.session_state.session_id}\'])
                 if not st.session_state.checkins:
                     st.warning("No check-in questions found. Check permissions or questionnaire setup in Basecamp.")
                     return
@@ -932,7 +932,7 @@ def main():
                     selected_checkin_data["account_id"],
                     selected_checkin_data["bucket_id"],
                     [selected_checkin_data["question_id"]],
-                    st.session_state.access_token,
+                    st.session_state[f\'access_token_{st.session_state.session_id}\'],
                     start_date.strftime("%Y-%m-%d"),
                     end_date.strftime("%Y-%m-%d")
                 )
@@ -1083,12 +1083,12 @@ def main():
         project = next((p for p in st.session_state.task_data if p['project_name'] == selected_project), None)
         
         if project:
-            if st.session_state.access_token and st.session_state.account_id:
+            if st.session_state[f\'access_token_{st.session_state.session_id}\'] and st.session_state.account_id:
                 if st.sidebar.button("Refresh Task Data"):
                     with st.spinner("Checking for task updates..."):
                         new_data, updated = check_new_task_data(
                             st.session_state.account_id,
-                            st.session_state.access_token,
+                            st.session_state[f\'access_token_{st.session_state.session_id}\'],
                             st.session_state.task_data,
                             selected_project
                         )
@@ -1158,13 +1158,13 @@ def main():
 
                     # Fetch new comments
                     if st.button("Fetch New Comments"):
-                        if st.session_state.access_token and st.session_state.account_id:
+                        if st.session_state[f\'access_token_{st.session_state.session_id}\'] and st.session_state.account_id:
                             with st.spinner("Fetching new comments..."):
                                 new_comments = get_new_comments(
                                     st.session_state.account_id,
                                     project['project_id'],
                                     task['id'],
-                                    st.session_state.access_token,
+                                    st.session_state[f\'access_token_{st.session_state.session_id}\'],
                                     task['comments']
                                 )
                                 if new_comments:
@@ -1179,7 +1179,7 @@ def main():
 
                     # Smart Reply with Mentions
                     st.subheader("Smart Reply")
-                    people = get_project_people(st.session_state.account_id, project['project_id'], st.session_state.access_token)
+                    people = get_project_people(st.session_state.account_id, project['project_id'], st.session_state[f\'access_token_{st.session_state.session_id}\'])
                     people_names = [person['name'] for person in people]
                     selected_mentions = st.multiselect("Select People to Mention", people_names, key="mentions_select")
                     if st.button("Generate Smart Reply"):
@@ -1196,7 +1196,7 @@ def main():
                                     st.session_state.account_id,
                                     project['project_id'],
                                     task['id'],
-                                    st.session_state.access_token,
+                                    st.session_state[f\'access_token_{st.session_state.session_id}\'],
                                     edited_reply
                                 )
                                 if success:
@@ -1205,7 +1205,7 @@ def main():
                                         st.session_state.account_id,
                                         project['project_id'],
                                         task['id'],
-                                        st.session_state.access_token,
+                                        st.session_state[f\'access_token_{st.session_state.session_id}\'],
                                         task['comments']
                                     )
                                     task['comments'].extend(new_comments)
@@ -1234,7 +1234,7 @@ def main():
             with st.spinner("Authenticating..."):
                 access_token = get_access_token()
                 if access_token:
-                    st.session_state.access_token = access_token
+                    st.session_state[f\'access_token_{st.session_state.session_id}\'] = access_token
                     account_id = get_account_info(access_token)
                     if account_id:
                         st.session_state.account_id = account_id
@@ -1258,14 +1258,14 @@ def main():
             <img src="https://via.placeholder.com/600x200.png?text=Debug" alt="Debug Image">
         </div>
         """, unsafe_allow_html=True)
-        if not st.session_state.access_token or not st.session_state.account_id:
+        if not st.session_state[f\'access_token_{st.session_state.session_id}\'] or not st.session_state.account_id:
             st.error("Please authenticate in the Settings page to view debug info.")
             return
 
         st.subheader("Check-in Fetching Debug")
         if st.button("Fetch Raw Check-in Data"):
             with st.spinner("Fetching raw check-in data..."):
-                headers = {"Authorization": f"Bearer {st.session_state.access_token}", "User-Agent": "BasecampAI (mulukenashenafi84@outlook.com)"}
+                headers = {"Authorization": f"Bearer {st.session_state[f\'access_token_{st.session_state.session_id}\']}", "User-Agent": "BasecampAI (mulukenashenafi84@outlook.com)"}
                 buckets_url = f"{BASE_URL}/{st.session_state.account_id}/projects.json"
                 buckets_response = retry_request(requests.get, buckets_url, headers=headers, timeout=REQUEST_TIMEOUT)
                 if buckets_response and buckets_response.ok:
@@ -1297,16 +1297,16 @@ def main():
         st.subheader("Task Fetching Debug")
         if st.button("Fetch Raw Task Data"):
             with st.spinner("Fetching raw task data..."):
-                projects = get_projects(st.session_state.account_id, st.session_state.access_token)
+                projects = get_projects(st.session_state.account_id, st.session_state[f\'access_token_{st.session_state.session_id}\'])
                 st.write(f"**Projects Fetched**: {len(projects)}")
                 st.json(projects)
                 for project in projects:
                     if project['todoset_id']:
-                        todolists = get_todoset(st.session_state.account_id, project['id'], project['todoset_id'], st.session_state.access_token)
+                        todolists = get_todoset(st.session_state.account_id, project['id'], project['todoset_id'], st.session_state[f\'access_token_{st.session_state.session_id}\'])
                         st.write(f"**Todolists for Project {project['name']}**: {len(todolists)}")
                         st.json(todolists)
                         for todolist in todolists:
-                            tasks = get_tasks(st.session_state.account_id, project['id'], todolist['id'], st.session_state.access_token)
+                            tasks = get_tasks(st.session_state.account_id, project['id'], todolist['id'], st.session_state[f\'access_token_{st.session_state.session_id}\'])
                             st.write(f"**Tasks for Todolist {todolist['title']}**: {len(tasks)}")
                             st.json(tasks)
 
