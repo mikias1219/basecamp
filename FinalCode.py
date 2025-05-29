@@ -845,6 +845,13 @@ import logging
 import re
 import requests
 from typing import Dict, List, Tuple
+import logging
+import re
+import requests
+from typing import Dict, List, Tuple
+import json
+import streamlit as st
+
 def generate_smart_reply(
     task: Dict,
     comments: List[Dict],
@@ -873,11 +880,9 @@ def generate_smart_reply(
         required_fields = ["sgid", "name", "id"]
         if not person or any(not person.get(field) for field in required_fields):
             logging.warning(f"Person {person.get('name', 'Unknown')} lacks required fields: {person}")
-            st.warning(f"Person {person.get('name', 'Unknown')} cannot be tagged due to missing data.")
             return False
         if person["sgid"] not in valid_people_dict:
             logging.warning(f"Person {person.get('name')} with sgid {person.get('sgid')} not found in project people")
-            st.warning(f"Person {person.get('name')} is not a valid project member and cannot be tagged.")
             return False
         return True
 
@@ -909,17 +914,17 @@ def generate_smart_reply(
 
     # Fetch the most recent comment
     def get_latest_comment(task_id: int, project_id: int, account_id: int, access_token: str, existing_comments: List[Dict]) -> Dict:
-        # Try fetching new comments first
-        new_comments = get_new_comments(account_id, project_id, task_id, access_token, existing_comments)
-        if new_comments:
-            # Return the most recent new comment
-            latest_new_comment = max(new_comments, key=lambda c: c.get('created_at', ''), default=None)
-            logging.debug(f"Fetched new comment: {latest_new_comment}")
-            return latest_new_comment
-        # Fallback to existing comments
+        try:
+            new_comments = get_new_comments(account_id, project_id, task_id, access_token, existing_comments)
+            if new_comments:
+                latest_new_comment = max(new_comments, key=lambda c: c.get('created_at', ''), default=None)
+                logging.debug(f"Fetched new comment: {latest_new_comment}")
+                return latest_new_comment
+        except Exception as e:
+            logging.error(f"Error fetching new comments: {str(e)}")
         return max(existing_comments, key=lambda c: c.get('created_at', ''), default=None) if existing_comments else None
 
-    # Analyze RAG data for interaction patterns and persona
+    # Analyze RAG data for interaction patterns
     rag_data = load_rag_data()
     interaction_patterns = []
     for entry in rag_data:
@@ -934,20 +939,43 @@ def generate_smart_reply(
                         'is_cultural': comment.get('is_cultural', False)
                     })
 
-    # Derive persona and communication style from RAG data
+    # Derive persona and communication style from RAG data with explicit examples
     persona_summary = (
-        "The team communicates in a professional, collaborative manner, often using greetings like 'Selam' to address colleagues, "
-        "acknowledging updates with 'Noted,' and confirming task completion with 'Done.' Comments are concise, action-oriented, "
-        "and focus on progress updates, issue resolution, or next steps. Mentions are used to ensure visibility among team members."
+        "The team communicates in a professional, collaborative manner. "
+        "Common greetings include 'Selam'. Comments are concise, action-oriented, "
+        "and focus on progress updates, issue resolution, or next steps. "
+        "Mentions are used to ensure visibility among team members. "
+        "When assigning cars, the format 'Please Use [Driver Name]' is standard. "
+        "When requesting cars, the format is 'Please assign a car for me [and others] to [destination] [via/from] [location]'.\n\n"
+        "**Examples of team communication:**\n"
+        "**Example 1 (Car Assignment Request):**\n"
+        "   Yosef Ambaye, Driver And Messager\n"
+        "   Selam Abduselam\n"
+        "   Please Use Mifta\n"
+        "**Example 2 (Car Assignment Request):**\n"
+        "   Tilahun Tegeyibalu, DCF and Power Technician I\n"
+        "   Selam Yosef\n"
+        "   Please assign a car for me JenberuMasresha and Sewmehon\n"
+        "   Cc Tasisa\n"
+        "**Example 3 (Car Assignment Response):**\n"
+        "   Yosef Ambaye, Driver And Messager\n"
+        "   Selam Tilahun\n"
+        "   Please Use Mifta\n"
+        "**Example 4 (Complex Car Assignment Request):**\n"
+        "   Semira Hussien, Civil and Architecture Engineer\n"
+        "   Selam Yosef\n"
+        "   Please assign a car for me, Sisay and Mebrate to MoTR and piyasa through HQ from ICT park\n"
     )
+
     if interaction_patterns:
         cultural_comments = [c for c in interaction_patterns if c['is_cultural']]
         sample_comments = cultural_comments[:3] or interaction_patterns[:3]
-        persona_summary += "\nSample interactions from RAG data:\n" + "\n".join(
-            [f"- {c['creator']}: {c['content']}" for c in sample_comments]
-        )
+        if sample_comments:
+            persona_summary += "\nAdditional relevant interaction samples from RAG data:\n" + "\n".join(
+                [f"- {c['creator']}: {c['content']}" for c in sample_comments]
+            )
     else:
-        persona_summary += "\nNo specific interaction samples available; defaulting to professional and concise style."
+        persona_summary += "\nNo dynamic interaction samples available from RAG data; relying on predefined examples."
 
     # Load task data for additional context
     task_data = load_task_data()
@@ -980,52 +1008,59 @@ def generate_smart_reply(
         access_token,
         comments
     ) if account_id and project_id and access_token else (comments[-1] if comments else None)
-
     comment_context = (
         f"Latest Comment by {latest_comment.get('creator', 'N/A')} ({latest_comment.get('created_at', 'N/A')}): "
         f"{clean_answer_text(latest_comment.get('content', 'N/A'))}"
     ) if latest_comment else "No recent comments available."
 
     # Prepare cultural context from RAG data
-    cultural_context = retrieve_relevant_data(rag_data, task, user_question, mode="insights")
-    if not cultural_context:
-        cultural_context = f"Current Task: {task.get('title', '')}, Status: {task.get('status', '')}, Due: {task.get('due_on', '')}"
+    cultural_context_rag = retrieve_relevant_data(rag_data, task, user_question, mode="insights")
+    if not cultural_context_rag:
+        cultural_context_rag = f"Current Task: {task.get('title', '')}, Status: {task.get('status', '')}, Due: {task.get('due_on', '')}"
 
     # Prepare prompt
     prompt_instruction = (
-        f"Generate a contextually clear, culturally appropriate reply for a Basecamp task, mimicking the team's interaction style from RAG data. "
-        f"Use terms like 'Selam' (greeting), 'Noted' (acknowledgment), and 'Done' (completion) where appropriate. "
-        f"Base the reply on the task details from task_data.json, the most recent comment, and the team's communication style from AllData_cleaned.json. "
-        f"Include mentions of the following people: {allowed_names}. "
-        f"Do NOT include company names (e.g., 'Network Solutions') or non-person entities. "
+        f"Generate a contextually clear, culturally appropriate Basecamp reply for a task. "
+        f"Strictly mimic the communication style and format shown in the 'Examples of team communication' provided below. "
+        f"Use 'Selam' as a greeting where appropriate. "
+        f"Only use 'Done' if the task status is 'completed'. "
+        f"Do NOT use 'Noted' after mentioning people or elsewhere unless explicitly relevant to acknowledging a specific comment. "
+        f"Base the reply on the task details, the most recent comment, and the team's communication patterns. "
+        f"Include mentions of the following allowed people: {allowed_names}. "
+        f"Do NOT include company names or non-person entities. "
         f"Do NOT repeat names or append fragments (e.g., 'Yabsra Fekadu Yabsra'). "
         f"Do NOT prefix names with 'Cc' in the body text. "
         f"If names are provided, start with 'Selam [Name]' for each mentioned person if appropriate, ensuring each name is used only once. "
-        f"If no names are provided, do not mention anyone."
+        f"If no names are provided, do not mention anyone. "
+        f"Focus on the request/update in the user input and the latest comment."
     )
 
     if user_question:
         question_context = f"User Input: {user_question}\n"
-        if "update" in user_question.lower() or reply_type == "Update":
+        if "assign a car for me" in user_question.lower() or "assign car" in user_question.lower():
+            prompt_instruction += (
+                f" This is a car assignment request. Respond in the style of 'Yosef Ambaye', assigning a driver using the 'Please Use [Driver Name]' format. "
+                f"If the request is for car assignment, provide only the driver assignment response. "
+            )
+        elif "update" in user_question.lower() or reply_type == "Update":
             prompt_instruction += (
                 f" Provide a concise status update addressing the user input and the latest comment. "
-                f"Use 'Done' if the task is complete, 'Noted' to acknowledge the input, and reference the latest comment's content."
+                f"Only use 'Done' if the task status is 'completed'. "
             )
         elif "question" in user_question.lower() or "?" in user_question:
             prompt_instruction += (
-                f" Answer the user's question concisely, using 'Noted' to acknowledge if appropriate, "
-                f"and incorporate relevant information from the latest comment."
+                f" Answer the user's question concisely, incorporating relevant information from the latest comment."
             )
         else:
             prompt_instruction += (
-                f" Generate a professional reply addressing the user's input, using 'Selam' or 'Noted' where fitting, "
+                f" Generate a professional reply addressing the user's input, using 'Selam' where fitting, "
                 f"and align with the latest comment's context."
             )
     else:
         question_context = ""
         prompt_instruction += (
-            f" Generate a concise, professional reply to the task, using 'Done' if the task is complete, "
-            f"'Noted' to acknowledge the latest comment, and align with its context."
+            f" Generate a concise, professional reply to the task, only using 'Done' if the task status is 'completed', "
+            f"and align with the latest comment's context."
         )
 
     if reply_type == "Short":
@@ -1034,34 +1069,22 @@ def generate_smart_reply(
         prompt_instruction += " Provide a detailed response (3-5 sentences)."
 
     prompt = f"""
-Team Interaction Style (from AllData_cleaned.json):
+{prompt_instruction}
+
+Team Interaction Style & Examples:
 {persona_summary}
 
-Cultural Context (from AllData_cleaned.json):
-{cultural_context}
+Cultural Context (from RAG data):
+{cultural_context_rag}
 
 Task Context (from task_data.json):
 {task_context}
 
-Task Details:
-- Title: {task['title']}
-- Status: {task['status']}
-- Due Date: {task['due_on']}
-- Assignee: {task['assignee']}
-- Creator: {task['creator']}
-- Latest Comment:
+Latest Relevant Comment:
 {comment_context}
+
 {question_context}
-
-{prompt_instruction}
-- Acknowledge the latest comment's content or task status using only the listed names.
-- Use 'Selam [Name]' as a greeting for each mentioned person if appropriate.
-- Use 'Noted' to acknowledge comments or questions, and 'Done' for completed tasks.
-- Ensure the reply is professional, concise, culturally aligned, and suitable for Basecamp.
-- Only include names from this list: {allowed_names}.
-- Address specific actions, questions, or issues mentioned in the latest comment to ensure contextual relevance.
 """
-
     logging.info(f"Sending prompt to Gemini: {prompt}")
     data = {"contents": [{"parts": [{"text": prompt}]}]}
     try:
@@ -1093,9 +1116,6 @@ Task Details:
             unexpected_names = found_names - all_valid_names
             if unexpected_names:
                 logging.warning(f"Unexpected names detected: {unexpected_names}")
-                st.warning(f"Unexpected names detected in reply: {', '.join(unexpected_names)}. Removing them.")
-                for name in unexpected_names:
-                    generated_content = re.sub(r'\b' + re.escape(name) + r'\b', '', generated_content)
                 generated_content = ' '.join(generated_content.split())
 
             # Initialize API content with proper Basecamp mention tags
@@ -1124,12 +1144,10 @@ Task Details:
         else:
             error_message = response.json().get("error", {}).get("message", "Unknown API error")
             logging.error(f"Gemini API error: {response.status_code} - {response.text}")
-            error_ui = f"Failed to generate reply: {error_message}."
-            return error_ui, error_ui, []
+            return "Unable to generate reply.", "Unable to generate reply.", []
     except Exception as e:
         logging.error(f"Gemini API request failed: {str(e)}")
-        error_ui = f"Error generating reply: {str(e)}."
-        return error_ui, error_ui, []
+        return "Unable to generate reply.", "Unable to generate reply.", []
 def process_mentions_in_reply(ui_reply: str, valid_people: List[Dict]) -> Tuple[str, str, List[Dict]]:
     """
     Process mentions for the reply, using the provided valid_people (from multiselect).
