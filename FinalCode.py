@@ -34,7 +34,7 @@ BASE_URL = "https://3.basecampapi.com"
 REQUEST_TIMEOUT = 15
 MAX_RETRIES = 3
 RATE_LIMIT_DELAY = 0.2
-API_KEY = "AIzaSyArWCID8FdgwcFJpS_mUJNlLy6QJhMvf5w"  # Gemini API key
+API_KEY = "AIzaSyBPnFzmj8bane698cwuNFHMhJ4SPb6b4po"  # Gemini API key
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={API_KEY}"
 CHECKIN_DATA_FILE = "checkin_data.json"
 TASK_DATA_FILE = "task_data.json"
@@ -855,6 +855,12 @@ def generate_smart_reply(
     account_id: int = None,
     access_token: str = None
 ) -> Tuple[str, str, List[Dict]]:
+    """
+    Generate a contextually clear, culturally appropriate smart reply for a Basecamp task.
+    Uses RAG data from AllData_cleaned.json and task data from task_data.json to mimic team interaction patterns.
+    Prioritizes the most recent comment by fetching new comments or using existing ones for context.
+    Returns (ui_reply, api_reply, edit_reply_data).
+    """
     headers = {"Content-Type": "application/json"}
     GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=AIzaSyArWCID8FdgwcFJpS_mUJNlLy6QJhMvf5w"
 
@@ -877,70 +883,196 @@ def generate_smart_reply(
 
     mentioned_people = [p for p in mentioned_people if validate_person(p)]
     unique_persons = {p["sgid"]: p for p in mentioned_people}
-
-    # Format mentions for prompt
     allowed_names = ", ".join(p["name"] for p in unique_persons.values()) or "none"
-    comment_context = "\n".join([f"Comment by {c.get('creator', 'N/A')}: {c.get('content', 'N/A')}" for c in comments]) or "No comments available."
 
-    # Prepare prompt with common words
+    # Load RAG data from AllData_cleaned.json
+    def load_rag_data() -> List[Dict]:
+        try:
+            with open("AllData_cleaned.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+                logging.debug(f"Loaded {len(data)} RAG entries from AllData_cleaned.json")
+                return data
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logging.debug(f"No RAG file found or invalid: {str(e)}")
+            return []
+
+    # Load task data from task_data.json
+    def load_task_data() -> List[Dict]:
+        try:
+            with open("task_data.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+                logging.debug(f"Loaded task data from task_data.json")
+                return data
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logging.debug(f"No task data file found or invalid: {str(e)}")
+            return []
+
+    # Fetch the most recent comment
+    def get_latest_comment(task_id: int, project_id: int, account_id: int, access_token: str, existing_comments: List[Dict]) -> Dict:
+        # Try fetching new comments first
+        new_comments = get_new_comments(account_id, project_id, task_id, access_token, existing_comments)
+        if new_comments:
+            # Return the most recent new comment
+            latest_new_comment = max(new_comments, key=lambda c: c.get('created_at', ''), default=None)
+            logging.debug(f"Fetched new comment: {latest_new_comment}")
+            return latest_new_comment
+        # Fallback to existing comments
+        return max(existing_comments, key=lambda c: c.get('created_at', ''), default=None) if existing_comments else None
+
+    # Analyze RAG data for interaction patterns and persona
+    rag_data = load_rag_data()
+    interaction_patterns = []
+    for entry in rag_data:
+        if entry.get('project_id') == project_id or not project_id:
+            comments = entry.get('comments', [])
+            for comment in comments:
+                cleaned_content = clean_answer_text(comment.get('cleaned_content', ''))
+                if cleaned_content:
+                    interaction_patterns.append({
+                        'creator': comment.get('creator', 'Unknown'),
+                        'content': cleaned_content,
+                        'is_cultural': comment.get('is_cultural', False)
+                    })
+
+    # Derive persona and communication style from RAG data
+    persona_summary = (
+        "The team communicates in a professional, collaborative manner, often using greetings like 'Selam' to address colleagues, "
+        "acknowledging updates with 'Noted,' and confirming task completion with 'Done.' Comments are concise, action-oriented, "
+        "and focus on progress updates, issue resolution, or next steps. Mentions are used to ensure visibility among team members."
+    )
+    if interaction_patterns:
+        cultural_comments = [c for c in interaction_patterns if c['is_cultural']]
+        sample_comments = cultural_comments[:3] or interaction_patterns[:3]
+        persona_summary += "\nSample interactions from RAG data:\n" + "\n".join(
+            [f"- {c['creator']}: {c['content']}" for c in sample_comments]
+        )
+    else:
+        persona_summary += "\nNo specific interaction samples available; defaulting to professional and concise style."
+
+    # Load task data for additional context
+    task_data = load_task_data()
+    task_context = ""
+    for project in task_data:
+        if project.get('project_id') == project_id:
+            for todolist in project.get('todolists', []):
+                for t in todolist.get('tasks', []):
+                    if t.get('id') == task.get('id'):
+                        task_context = (
+                            f"Task Context from task_data.json:\n"
+                            f"- Project: {project.get('project_name', 'N/A')}\n"
+                            f"- Todolist: {todolist.get('todolist_name', 'N/A')}\n"
+                            f"- Task Status: {t.get('status', 'N/A')}\n"
+                            f"- Assignee: {t.get('assignee', 'Unassigned')}\n"
+                            f"- Due Date: {t.get('due_on', 'N/A')}\n"
+                            f"- Recent Comments: {len(t.get('comments', []))} comments"
+                        )
+                        break
+                if task_context:
+                    break
+    if not task_context:
+        task_context = "No additional task context found in task_data.json."
+
+    # Fetch the most recent comment
+    latest_comment = get_latest_comment(
+        task['id'],
+        project_id,
+        account_id,
+        access_token,
+        comments
+    ) if account_id and project_id and access_token else (comments[-1] if comments else None)
+
+    comment_context = (
+        f"Latest Comment by {latest_comment.get('creator', 'N/A')} ({latest_comment.get('created_at', 'N/A')}): "
+        f"{clean_answer_text(latest_comment.get('content', 'N/A'))}"
+    ) if latest_comment else "No recent comments available."
+
+    # Prepare cultural context from RAG data
+    cultural_context = retrieve_relevant_data(rag_data, task, user_question, mode="insights")
+    if not cultural_context:
+        cultural_context = f"Current Task: {task.get('title', '')}, Status: {task.get('status', '')}, Due: {task.get('due_on', '')}"
+
+    # Prepare prompt
     prompt_instruction = (
-        f"Generate a professional reply for a Basecamp task, using culturally appropriate terms like 'Selam' (as a greeting), 'Noted' (to acknowledge), and 'Done' (to indicate completion) where suitable. "
-        f"Use only these names in the reply body: {allowed_names}. "
-        f"Do NOT include company names (e.g., 'Network Solutions') or other non-person entities. "
+        f"Generate a contextually clear, culturally appropriate reply for a Basecamp task, mimicking the team's interaction style from RAG data. "
+        f"Use terms like 'Selam' (greeting), 'Noted' (acknowledgment), and 'Done' (completion) where appropriate. "
+        f"Base the reply on the task details from task_data.json, the most recent comment, and the team's communication style from AllData_cleaned.json. "
+        f"Include mentions of the following people: {allowed_names}. "
+        f"Do NOT include company names (e.g., 'Network Solutions') or non-person entities. "
         f"Do NOT repeat names or append fragments (e.g., 'Yabsra Fekadu Yabsra'). "
         f"Do NOT prefix names with 'Cc' in the body text. "
-        f"If names are provided, start with 'Selam [Name]' if appropriate. "
+        f"If names are provided, start with 'Selam [Name]' for each mentioned person if appropriate, ensuring each name is used only once. "
         f"If no names are provided, do not mention anyone."
     )
+
     if user_question:
-        question_context = f"User Question: {user_question}\n"
+        question_context = f"User Input: {user_question}\n"
         if "update" in user_question.lower() or reply_type == "Update":
-            prompt_instruction += " Provide a concise status update using 'Done' if the task is complete or 'Noted' to acknowledge the question."
+            prompt_instruction += (
+                f" Provide a concise status update addressing the user input and the latest comment. "
+                f"Use 'Done' if the task is complete, 'Noted' to acknowledge the input, and reference the latest comment's content."
+            )
         elif "question" in user_question.lower() or "?" in user_question:
-            prompt_instruction += " Answer the user's question concisely, using 'Noted' to acknowledge if appropriate."
+            prompt_instruction += (
+                f" Answer the user's question concisely, using 'Noted' to acknowledge if appropriate, "
+                f"and incorporate relevant information from the latest comment."
+            )
         else:
-            prompt_instruction += " Generate a professional reply addressing the user's input, using 'Selam' or 'Noted' where fitting."
+            prompt_instruction += (
+                f" Generate a professional reply addressing the user's input, using 'Selam' or 'Noted' where fitting, "
+                f"and align with the latest comment's context."
+            )
     else:
         question_context = ""
-        prompt_instruction += " Generate a concise, professional reply to the task, using 'Done' if the task is complete or 'Noted' to acknowledge comments."
+        prompt_instruction += (
+            f" Generate a concise, professional reply to the task, using 'Done' if the task is complete, "
+            f"'Noted' to acknowledge the latest comment, and align with its context."
+        )
 
     if reply_type == "Short":
         prompt_instruction += " Keep the reply short (1-2 sentences)."
     elif reply_type == "Long":
         prompt_instruction += " Provide a detailed response (3-5 sentences)."
 
-    # Add cultural context
-    cultural_context = retrieve_relevant_data(load_rag_data(), task, "", mode="insights")
-    if cultural_context:
-        prompt_instruction = f"Consider the following cultural context:\n{cultural_context}\n\n{prompt_instruction}"
-
     prompt = f"""
-Task: {task['title']}
-Status: {task['status']}
-Due Date: {task['due_on']}
-Assignee: {task['assignee']}
-Creator: {task['creator']}
-Comments: {comment_context}
+Team Interaction Style (from AllData_cleaned.json):
+{persona_summary}
+
+Cultural Context (from AllData_cleaned.json):
+{cultural_context}
+
+Task Context (from task_data.json):
+{task_context}
+
+Task Details:
+- Title: {task['title']}
+- Status: {task['status']}
+- Due Date: {task['due_on']}
+- Assignee: {task['assignee']}
+- Creator: {task['creator']}
+- Latest Comment:
+{comment_context}
 {question_context}
 
 {prompt_instruction}
-- Acknowledge the latest comment or task status using only the listed names in the body.
-- Use 'Selam [Name]' as a greeting if mentioning specific people, 'Noted' to acknowledge comments or questions, and 'Done' for completed tasks.
-- Ensure the reply is professional, concise, and suitable for Basecamp.
-- Do NOT include unlisted names or non-person entities: {allowed_names}.
+- Acknowledge the latest comment's content or task status using only the listed names.
+- Use 'Selam [Name]' as a greeting for each mentioned person if appropriate.
+- Use 'Noted' to acknowledge comments or questions, and 'Done' for completed tasks.
+- Ensure the reply is professional, concise, culturally aligned, and suitable for Basecamp.
+- Only include names from this list: {allowed_names}.
+- Address specific actions, questions, or issues mentioned in the latest comment to ensure contextual relevance.
 """
 
     logging.info(f"Sending prompt to Gemini: {prompt}")
     data = {"contents": [{"parts": [{"text": prompt}]}]}
     try:
-        response = requests.post(GEMINI_URL, headers=headers, json=data, timeout=REQUEST_TIMEOUT)
+        response = requests.post(GEMINI_URL, headers=headers, json=data, timeout=15)
         if response.ok:
             result = response.json()
             generated_content = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "No reply generated").strip()
             logging.debug(f"Raw Gemini response: {generated_content}")
 
             # Clean UI content
-            generated_content = re.sub(r'\s*,\s*,\s*', ', ', generated_content)
+            generated_content = re.sub(r'\聞\s*,\s*,\s*', ', ', generated_content)
             generated_content = re.sub(r'\s*\.\s*\.\s*', '. ', generated_content)
             generated_content = re.sub(r'\s+', ' ', generated_content).strip()
             if not generated_content.endswith('.'):
@@ -966,8 +1098,11 @@ Comments: {comment_context}
                     generated_content = re.sub(r'\b' + re.escape(name) + r'\b', '', generated_content)
                 generated_content = ' '.join(generated_content.split())
 
-            # Initialize API content
+            # Initialize API content with proper Basecamp mention tags
             api_content = generated_content
+            for person in unique_persons.values():
+                mention_tag = format_mentions(person, is_cc=False)
+                api_content = re.sub(rf'\b{re.escape(person["name"])}\b', mention_tag, api_content, 1)
 
             # Prepare edit reply data
             edit_reply_data = [
@@ -997,45 +1132,30 @@ Comments: {comment_context}
         return error_ui, error_ui, []
 def process_mentions_in_reply(ui_reply: str, valid_people: List[Dict]) -> Tuple[str, str, List[Dict]]:
     """
-    Process @Name mentions in the UI reply, converting them to Basecamp <bc-attachment> tags for API content.
+    Process mentions for the reply, using the provided valid_people (from multiselect).
     Returns (ui_reply, api_reply, mentioned_people_data).
     """
     mentioned_people_data = []
     api_reply = ui_reply
     valid_people_dict = {p["name"].lower(): p for p in valid_people if p.get("sgid") and p.get("name") and p.get("id")}
 
-    # Find all @Name mentions
-    mention_pattern = r'@([A-Za-z\s]+)(?=\s|$|[.,!?])'
-    matches = re.findall(mention_pattern, ui_reply)
-    
-    for name in matches:
-        name = name.strip()
-        name_lower = name.lower()
-        # Try to match full name first, then partial (first name)
-        person = valid_people_dict.get(name_lower)
-        if not person:
-            # Try partial match (e.g., just first name)
-            person = next((p for n, p in valid_people_dict.items() if n.startswith(name_lower)), None)
-        if person:
-            if person not in mentioned_people_data:
-                mentioned_people_data.append({
-                    "name": person["name"],
-                    "sgid": person["sgid"],
-                    "id": person["id"],
-                    "email_address": person.get("email_address", "N/A"),
-                    "title": person.get("title", ""),
-                    "company": person.get("company", "N/A"),
-                    "avatar_url": person.get("avatar_url", "https://bc3-production-assets-cdn.basecamp-static.com/default/avatar?v=1")
-                })
-            mention_tag = format_mentions(person, is_cc=False)
-            # Replace @Name with plain name in UI reply, and with <bc-attachment> in API reply
-            ui_reply = re.sub(rf'@{re.escape(name)}\b', person["name"], ui_reply, flags=re.IGNORECASE)
-            api_reply = re.sub(rf'@{re.escape(name)}\b', mention_tag, api_reply, flags=re.IGNORECASE)
-        else:
-            logging.warning(f"Mentioned name '{name}' not found in valid people")
-            st.warning(f"'{name}' is not a valid project member and will not be tagged.")
+    # Use the provided valid_people as the mentioned people (from multiselect)
+    for person in valid_people:
+        if person not in mentioned_people_data:
+            mentioned_people_data.append({
+                "name": person["name"],
+                "sgid": person["sgid"],
+                "id": person["id"],
+                "email_address": person.get("email_address", "N/A"),
+                "title": person.get("title", ""),
+                "company": person.get("company", "N/A"),
+                "avatar_url": person.get("avatar_url", "https://bc3-production-assets-cdn.basecamp-static.com/default/avatar?v=1")
+            })
+        mention_tag = format_mentions(person, is_cc=False)
+        # Ensure name is only replaced once to avoid duplicates
+        api_reply = re.sub(rf'\b{re.escape(person["name"])}\b', mention_tag, api_reply, 1)
 
-    # Clean up any remaining @ symbols
+    # Clean up any stray @ symbols in both UI and API reply
     ui_reply = re.sub(r'@\w+\b', '', ui_reply)
     api_reply = re.sub(r'@\w+\b', '', api_reply)
 
@@ -1473,17 +1593,29 @@ def main():
                         people_names = []
                     else:
                         people_names = [p['name'] for p in people if p.get("name") and p.get("sgid") and p.get("id")]
-                        st.write("**Mention People**: Type @Name in the reply below to tag project members (e.g., @Mikias).")
+                        st.write("**Select People to Mention**: Choose team members to tag in your reply.")
+
+                    # Multiselect for choosing people to mention
+                    selected_people = st.multiselect(
+                        "Mention People",
+                        options=people_names,
+                        default=st.session_state.get('selected_mentions', []),
+                        key="mention_select",
+                        help="Select people to mention in the reply. Their names will be added as tags."
+                    )
+                    st.session_state.selected_mentions = selected_people
 
                     user_question = st.text_input("Enter your question or context for the smart reply (optional):", key="user_question")
                     reply_type = st.selectbox("Select reply type:", ["Short", "Long", "Update"], key="reply_type")
 
                     if st.button("Generate Smart Reply", key="generate_smart_reply_task"):
                         with st.spinner("Generating reply..."):
+                            # Filter selected people data
+                            selected_people_data = [p for p in people if p['name'] in selected_people]
                             ui_reply, api_reply, edit_reply_data = generate_smart_reply(
                                 task,
                                 task['comments'],
-                                [],  # No mentions initially; user will add via @Name in edit
+                                selected_people_data,  # Pass selected people
                                 user_question=user_question,
                                 reply_type=reply_type,
                                 project_id=project['project_id'],
@@ -1501,28 +1633,30 @@ def main():
                                 st.session_state.edit_reply_data = edit_reply_data
                                 st.markdown(f"<div class='output-box'><strong>Suggested Reply</strong>:<br>{ui_reply}</div>", unsafe_allow_html=True)
                                 st.session_state.edit_reply = ui_reply
-                                if edit_reply_data:
-                                    st.subheader("Mentioned People")
-                                    for person in edit_reply_data:
-                                        st.write(f"- Name: {person['name']}, SGID: {person['sgid']}, ID: {person['id']}, "
-                                                 f"Email: {person.get('email_address', 'N/A')}, Title: {person.get('title', '')}, "
-                                                 f"Company: {person.get('company', 'N/A')}, Avatar: {person.get('avatar_url')}")
 
                     if st.session_state.get("smart_reply"):
                         initial_reply = "" if st.session_state.get("reset_reply", False) else st.session_state.get("edit_reply", st.session_state.smart_reply)
-                        edited_reply = st.text_area("Edit Reply", value=initial_reply, key="edit_reply", help="Type @Name to mention people (e.g., @Mikias).")
+                        edited_reply = st.text_area(
+                            "Edit Reply",
+                            value=initial_reply,
+                            key="edit_reply",
+                            help="Edit the reply. Selected people will be tagged automatically."
+                        )
                         if st.session_state.get("reset_reply", False):
                             st.session_state.reset_reply = False
 
                         if st.button("Post Reply", key="post_reply"):
                             with st.spinner("Posting reply..."):
+                                # Process mentions based on selected people
+                                selected_people_data = [p for p in people if p['name'] in st.session_state.selected_mentions]
+                                ui_reply, api_reply, mentioned_people_data = process_mentions_in_reply(edited_reply, selected_people_data)
                                 success, display_content = post_comment(
                                     st.session_state.account_id,
                                     project['project_id'],
                                     task['id'],
                                     st.session_state.get(f'access_token_{st.session_state.session_id}'),
-                                    edited_reply,
-                                    people
+                                    api_reply,  # Use API reply with proper tags
+                                    selected_people_data
                                 )
                                 if success:
                                     st.success("Reply posted successfully!")
@@ -1539,6 +1673,7 @@ def main():
                                     st.session_state.smart_reply = None
                                     st.session_state.smart_reply_api = None
                                     st.session_state.edit_reply_data = []
+                                    st.session_state.selected_mentions = []
                                     st.session_state.comment_page = 1
                                     st.session_state.reset_reply = True
                                 else:
